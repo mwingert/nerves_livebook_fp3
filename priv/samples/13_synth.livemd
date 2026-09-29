@@ -153,10 +153,12 @@ defmodule Theremin.Scene do
   @octaves 4
   @waves [:sine, :square, :saw]
   @names ~w(A A# B C C# D D# E F F# G G#)
+  # Band colours by {sharp?, lit?}: the note under the finger lights up.
+  @fills %{{false, false} => {30, 36, 84}, {true, false} => {12, 14, 36}, {false, true} => {110, 140, 255}, {true, true} => {80, 100, 210}}
 
   @impl Scenic.Scene
   def init(scene, _param, _opts) do
-    # Landscape: everything is drawn on a turned canvas, with the volume buttons on top.
+    # Landscape: everything is drawn on a turned canvas, with the volume buttons at the bottom.
     {screen_w, screen_h} = scene.viewport.size
     {width, height} = {screen_h, screen_w}
 
@@ -171,12 +173,12 @@ defmodule Theremin.Scene do
           |> text("sine: volume buttons change it", id: :wave, fill: :light_gray, translate: {60, 240})
           |> circle(60, id: :dot, fill: :yellow, hidden: true)
         end,
-        rotate: :math.pi() / 2,
-        translate: {screen_w, 0}
+        rotate: -:math.pi() / 2,
+        translate: {0, screen_h}
       )
 
     request_input(scene, [:cursor_button, :cursor_pos, :key])
-    {:ok, scene |> assign(graph: graph, size: {width, height}, down: false, wave: :sine) |> push_graph(graph)}
+    {:ok, scene |> assign(graph: graph, size: {width, height}, down: false, wave: :sine, lit: nil) |> push_graph(graph)}
   end
 
   # One band per note, centred on its pitch: sharps dark like piano keys, naturals labelled.
@@ -187,15 +189,22 @@ defmodule Theremin.Scene do
     Enum.reduce(0..notes, graph, fn n, graph ->
       name = Enum.at(@names, Integer.mod(n, 12))
       x = band * (n - 0.5)
-      fill = if String.ends_with?(name, "#"), do: {12, 14, 36}, else: {30, 36, 84}
-      graph = rect(graph, {band, height}, fill: fill, stroke: {1, {20, 24, 60}}, translate: {x, 0})
+      sharp = String.ends_with?(name, "#")
+      graph = rect(graph, {band, height}, id: {:band, n}, fill: @fills[{sharp, false}], stroke: {1, {20, 24, 60}}, translate: {x, 0})
 
       cond do
-        String.ends_with?(name, "#") -> graph
+        sharp -> graph
         name == "C" -> label(graph, n, :white, {x + band / 2, height - 30})
         true -> label(graph, n, {150, 160, 230}, {x + band / 2, height - 30})
       end
     end)
+  end
+
+  defp light(graph, nil, _lit), do: graph
+
+  defp light(graph, n, lit) do
+    sharp = String.ends_with?(Enum.at(@names, Integer.mod(n, 12)), "#")
+    Graph.modify(graph, {:band, n}, &Scenic.Primitive.put_style(&1, :fill, @fills[{sharp, lit}]))
   end
 
   defp label(graph, n, fill, pos),
@@ -208,8 +217,9 @@ defmodule Theremin.Scene do
     Synth.off()
 
     scene.assigns.graph
+    |> light(scene.assigns.lit, false)
     |> Graph.modify(:dot, &circle(&1, 60, hidden: true))
-    |> show(assign(scene, down: false))
+    |> show(assign(scene, down: false, lit: nil))
   end
 
   def handle_input({:cursor_pos, pos}, _id, %{assigns: %{down: true}} = scene), do: play(scene, pos)
@@ -230,15 +240,21 @@ defmodule Theremin.Scene do
   defp play(scene, {screen_x, screen_y}) do
     {width, height} = scene.assigns.size
     # Touches arrive in portrait screen coordinates: turn them back into the canvas.
-    {x, y} = {screen_y, height - screen_x}
+    {x, y} = {width - screen_y, screen_x}
     freq = @low * 2 ** (@octaves * x / width)
     Synth.set(freq, 0.5 * (1 - y / height))
+    lit = round(12 * @octaves * x / width)
 
     scene.assigns.graph
+    |> relight(scene.assigns.lit, lit)
     |> Graph.modify(:dot, &circle(&1, 60, translate: {x, y}, hidden: false))
     |> Graph.modify(:note, &text(&1, "#{note_name(freq)}  #{round(freq)} Hz"))
-    |> show(scene)
+    |> show(assign(scene, lit: lit))
   end
+
+  # Only recolour when the finger crosses into another note.
+  defp relight(graph, same, same), do: graph
+  defp relight(graph, old, new), do: graph |> light(old, false) |> light(new, true)
 
   # The nearest note, counted in semitones from A4 (440 Hz).
   defp note_name(freq) do
@@ -258,7 +274,7 @@ has to be running (see above).
 The screen is 1080 × 2160 in portrait, and the driver only draws in
 portrait. So the scene draws on a 2160 × 1080 canvas and turns it a
 quarter turn onto the screen, and turns each touch back the other way.
-Hold the phone with the volume buttons on top.
+Hold the phone with the volume buttons at the bottom.
 
 ```elixir
 fbcon =
