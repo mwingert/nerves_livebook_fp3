@@ -1,0 +1,262 @@
+# A theremin synth
+
+## Overview
+
+Turn the screen into a theremin: slide a finger left and right to change
+the pitch, up and down to change the volume. Any button (volume up,
+volume down, power) switches the waveform.
+
+Two parts work together:
+
+* `Synth`, a process that computes the sound sample by sample and
+  streams it into one long-running `aplay`,
+* a Scenic scene that turns touches into `Synth.set(frequency, volume)`.
+
+This builds on the [Audio](10_audio.livemd) and
+[Screen, touch and buttons](11_screen_touch_buttons.livemd) notebooks.
+
+## Route audio to the loudspeaker
+
+Already done at boot on a Fairphone 3+. Run it if you switched to the
+earpiece in the Audio notebook.
+
+```elixir
+for {name, value} <- [
+      {"Earpiece Switch", :off},
+      {"SLIMBUS_0_RX Audio Mixer MultiMedia1", :off},
+      {"QUIN_MI2S_RX Audio Mixer MultiMedia1", :on},
+      {"Speaker Switch", :on}
+    ],
+    do: {name, ExAudio.cset(name, value)}
+```
+
+## The synth
+
+`aplay` reads raw 16-bit samples from its standard input and plays them
+as they arrive, so no WAV files are involved. Every 5 ms the synth
+works out how many samples the speaker will need by 30 ms from now and
+writes exactly those. That keeps the delay between touch and sound
+short, and the sound never falls behind.
+
+Frequency and volume slide from their old to their new value across
+each chunk, and the waveform's phase carries over between chunks.
+Without that, every finger movement would click.
+
+```elixir
+defmodule Synth do
+  use GenServer
+
+  @rate 48_000
+  @tick_ms 5
+  # How far ahead of the speaker we write: lower is snappier, higher survives hiccups.
+  @lead div(@rate * 30, 1000)
+
+  def start, do: GenServer.start(__MODULE__, nil, name: __MODULE__)
+  def stop, do: GenServer.stop(__MODULE__)
+
+  @doc "Play `freq` Hz at volume `amp` (0.0 to 1.0)."
+  def set(freq, amp), do: GenServer.cast(__MODULE__, {:set, freq, amp |> max(0.0) |> min(1.0)})
+  def off, do: GenServer.cast(__MODULE__, :off)
+  def wave(wave) when wave in [:sine, :square, :saw], do: GenServer.cast(__MODULE__, {:wave, wave})
+
+  def initial, do: %{freq: 440.0, amp: 0.0, cur_freq: 440.0, cur_amp: 0.0, phase: 0.0, wave: :sine}
+
+  @doc "Renders `n` samples as S16_LE and returns them with the updated state."
+  def render(s, n) do
+    {samples, phase} =
+      Enum.map_reduce(0..(n - 1)//1, s.phase, fn i, phase ->
+        t = i / n
+        freq = s.cur_freq + (s.freq - s.cur_freq) * t
+        amp = s.cur_amp + (s.amp - s.cur_amp) * t
+        sample = round(amp * shape(s.wave, phase) * 32_767)
+        phase = phase + freq / @rate
+        {<<sample::signed-little-16>>, phase - Float.floor(phase)}
+      end)
+
+    {IO.iodata_to_binary(samples), %{s | phase: phase, cur_freq: s.freq, cur_amp: s.amp}}
+  end
+
+  defp shape(:sine, phase), do: :math.sin(2 * :math.pi() * phase)
+  # Square and saw are much louder than a sine at the same amplitude.
+  defp shape(:square, phase), do: if(phase < 0.5, do: 0.4, else: -0.4)
+  defp shape(:saw, phase), do: 0.6 * (2 * phase - 1)
+
+  @impl GenServer
+  def init(nil) do
+    args = ~w(-q -D plughw:0,0 -t raw -f S16_LE -r #{@rate} -c 1 --buffer-time=60000 --period-time=10000 -)
+    port = Port.open({:spawn_executable, System.find_executable("aplay")}, [:binary, :exit_status, args: args])
+    :timer.send_interval(@tick_ms, :tick)
+    {:ok, Map.merge(initial(), %{port: port, start: now(), written: 0})}
+  end
+
+  @impl GenServer
+  def handle_cast({:set, freq, amp}, s), do: {:noreply, %{s | freq: freq, amp: amp}}
+  def handle_cast(:off, s), do: {:noreply, %{s | amp: 0.0}}
+  def handle_cast({:wave, wave}, s), do: {:noreply, %{s | wave: wave}}
+
+  @impl GenServer
+  def handle_info(:tick, s) do
+    due = div((now() - s.start) * @rate, 1_000_000) + @lead
+    # After a long pause (busy CPU), skip ahead instead of piling up delay.
+    written = max(s.written, due - 2 * @lead)
+    {chunk, s} = render(s, due - written)
+    Port.command(s.port, chunk)
+    {:noreply, %{s | written: due}}
+  end
+
+  def handle_info({port, {:exit_status, code}}, %{port: port} = s), do: {:stop, {:aplay_exited, code}, s}
+
+  defp now, do: System.monotonic_time(:microsecond)
+end
+```
+
+A quick check of `render/2`: 100 samples take 200 bytes, and two
+chunks of 100 samples join into exactly the same wave as one chunk of
+200, with no jump in between.
+
+```elixir
+s = %{Synth.initial() | amp: 0.5, cur_amp: 0.5}
+{a, s1} = Synth.render(s, 100)
+{b, _} = Synth.render(s1, 100)
+{whole, _} = Synth.render(s, 200)
+
+true = byte_size(a) == 200
+true = a <> b == whole
+```
+
+Start it and play a note for one second:
+
+```elixir
+{:ok, _} = Synth.start()
+Synth.set(440, 0.3)
+Process.sleep(1000)
+Synth.off()
+```
+
+## The pad
+
+The screen spans 4 octaves, from A2 (110 Hz) on the left to A6
+(1760 Hz) on the right. Each octave is the same width, so the pitch
+rises evenly as you slide. The top of the screen is loud and the bottom
+is silent.
+
+```elixir
+defmodule Theremin.Scene do
+  use Scenic.Scene
+  alias Scenic.Graph
+  import Scenic.Primitives
+
+  @low 110
+  @octaves 4
+  @waves [:sine, :square, :saw]
+  @names ~w(A A# B C C# D D# E F F# G G#)
+
+  @impl Scenic.Scene
+  def init(scene, _param, _opts) do
+    {width, height} = scene.viewport.size
+
+    graph =
+      Graph.build(font: :roboto, font_size: 44)
+      |> rect({width, height}, fill: {20, 24, 60})
+      |> octave_lines(width, height)
+      |> text("Slide to play", id: :note, font_size: 96, fill: :white, translate: {60, 160})
+      |> text("sine: press a button to change", id: :wave, fill: :light_gray, translate: {60, 240})
+      |> circle(60, id: :dot, fill: :yellow, hidden: true)
+
+    request_input(scene, [:cursor_button, :cursor_pos, :key])
+    {:ok, scene |> assign(graph: graph, size: {width, height}, down: false, wave: :sine) |> push_graph(graph)}
+  end
+
+  defp octave_lines(graph, width, height) do
+    Enum.reduce(0..@octaves, graph, fn k, graph ->
+      x = width * k / @octaves
+
+      graph
+      |> line({{x, 0}, {x, height}}, stroke: {2, {80, 90, 160}})
+      |> text(note_name(@low * 2 ** k), fill: {120, 130, 200}, translate: {x + 10, height - 40})
+    end)
+  end
+
+  @impl Scenic.Scene
+  def handle_input({:cursor_button, {_button, 1, _mods, pos}}, _id, scene), do: play(assign(scene, down: true), pos)
+
+  def handle_input({:cursor_button, {_button, 0, _mods, _pos}}, _id, scene) do
+    Synth.off()
+
+    scene.assigns.graph
+    |> Graph.modify(:dot, &circle(&1, 60, hidden: true))
+    |> show(assign(scene, down: false))
+  end
+
+  def handle_input({:cursor_pos, pos}, _id, %{assigns: %{down: true}} = scene), do: play(scene, pos)
+
+  def handle_input({:key, {_key, 1, _mods}}, _id, scene) do
+    wave = Enum.at(@waves, rem(Enum.find_index(@waves, &(&1 == scene.assigns.wave)) + 1, length(@waves)))
+    Synth.wave(wave)
+
+    scene.assigns.graph
+    |> Graph.modify(:wave, &text(&1, "#{wave}: press a button to change"))
+    |> show(assign(scene, wave: wave))
+  end
+
+  def handle_input(_input, _id, scene), do: {:noreply, scene}
+
+  defp play(scene, {x, y}) do
+    {width, height} = scene.assigns.size
+    freq = @low * 2 ** (@octaves * x / width)
+    Synth.set(freq, 0.5 * (1 - y / height))
+
+    scene.assigns.graph
+    |> Graph.modify(:dot, &circle(&1, 60, translate: {x, y}, hidden: false))
+    |> Graph.modify(:note, &text(&1, "#{note_name(freq)}  #{round(freq)} Hz"))
+    |> show(scene)
+  end
+
+  # The nearest note, counted in semitones from A4 (440 Hz).
+  defp note_name(freq) do
+    n = round(12 * :math.log2(freq / 440))
+    "#{Enum.at(@names, Integer.mod(n, 12))}#{4 + Integer.floor_div(n + 9, 12)}"
+  end
+
+  defp show(graph, scene), do: {:noreply, scene |> assign(graph: graph) |> push_graph(graph)}
+end
+```
+
+## Play
+
+Detach the IEx console from the screen, then start the pad. The synth
+has to be running (see above).
+
+```elixir
+fbcon =
+  Path.wildcard("/sys/class/vtconsole/vtcon*")
+  |> Enum.find(&(File.read!(Path.join(&1, "name")) =~ "frame buffer"))
+
+File.write!(Path.join(fbcon, "bind"), "0")
+File.write!("/sys/class/graphics/fb0/blank", "0")
+
+{:ok, viewport} =
+  Scenic.ViewPort.start(
+    name: :fp3_screen,
+    size: {1080, 2160},
+    default_scene: Theremin.Scene,
+    # cursor: true makes the driver report finger movement, not just touch and release.
+    drivers: [[module: Scenic.Driver.Local, cursor: true]]
+  )
+```
+
+Try these:
+
+* Change `@low` or `@octaves` in the scene, run **Stop**, then run
+  the scene and **Play** cells again.
+* Add a waveform of your own to `shape/2` in `Synth`.
+* Replace the volume with the phone's tilt from the
+  [Sensors](03_sensors.livemd) notebook.
+
+## Stop
+
+```elixir
+Scenic.ViewPort.stop(viewport)
+Synth.stop()
+File.write!(Path.join(fbcon, "bind"), "1")
+```
