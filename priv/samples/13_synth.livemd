@@ -3,8 +3,8 @@
 ## Overview
 
 Turn the screen into a theremin: slide a finger left and right to change
-the pitch, up and down to change the volume. Any button (volume up,
-volume down, power) switches the waveform.
+the pitch, up and down to change the volume. The volume buttons switch
+the waveform.
 
 Two parts work together:
 
@@ -136,8 +136,11 @@ Synth.off()
 ## The pad
 
 The screen spans 4 octaves, from A2 (110 Hz) on the left to A6
-(1760 Hz) on the right. Each octave is the same width, so the pitch
-rises evenly as you slide. The top of the screen is loud and the bottom
+(1760 Hz) on the right. Each note gets a band of the same width, dark
+for sharps like the black keys on a piano, and every white key is
+labelled, with the Cs in white.
+The pitch slides smoothly between them, so a note is only in tune in
+the middle of its band. The top of the screen is loud and the bottom
 is silent.
 
 ```elixir
@@ -153,29 +156,50 @@ defmodule Theremin.Scene do
 
   @impl Scenic.Scene
   def init(scene, _param, _opts) do
-    {width, height} = scene.viewport.size
+    # Landscape: everything is drawn on a turned canvas, with the volume buttons on top.
+    {screen_w, screen_h} = scene.viewport.size
+    {width, height} = {screen_h, screen_w}
 
     graph =
       Graph.build(font: :roboto, font_size: 44)
-      |> rect({width, height}, fill: {20, 24, 60})
-      |> octave_lines(width, height)
-      |> text("Slide to play", id: :note, font_size: 96, fill: :white, translate: {60, 160})
-      |> text("sine: press a button to change", id: :wave, fill: :light_gray, translate: {60, 240})
-      |> circle(60, id: :dot, fill: :yellow, hidden: true)
+      |> group(
+        fn g ->
+          g
+          |> rect({width, height}, fill: {20, 24, 60})
+          |> note_bands(width, height)
+          |> text("Slide to play", id: :note, font_size: 96, fill: :white, translate: {60, 160})
+          |> text("sine: volume buttons change it", id: :wave, fill: :light_gray, translate: {60, 240})
+          |> circle(60, id: :dot, fill: :yellow, hidden: true)
+        end,
+        rotate: :math.pi() / 2,
+        translate: {screen_w, 0}
+      )
 
     request_input(scene, [:cursor_button, :cursor_pos, :key])
     {:ok, scene |> assign(graph: graph, size: {width, height}, down: false, wave: :sine) |> push_graph(graph)}
   end
 
-  defp octave_lines(graph, width, height) do
-    Enum.reduce(0..@octaves, graph, fn k, graph ->
-      x = width * k / @octaves
+  # One band per note, centred on its pitch: sharps dark like piano keys, naturals labelled.
+  defp note_bands(graph, width, height) do
+    notes = 12 * @octaves
+    band = width / notes
 
-      graph
-      |> line({{x, 0}, {x, height}}, stroke: {2, {80, 90, 160}})
-      |> text(note_name(@low * 2 ** k), fill: {120, 130, 200}, translate: {x + 10, height - 40})
+    Enum.reduce(0..notes, graph, fn n, graph ->
+      name = Enum.at(@names, Integer.mod(n, 12))
+      x = band * (n - 0.5)
+      fill = if String.ends_with?(name, "#"), do: {12, 14, 36}, else: {30, 36, 84}
+      graph = rect(graph, {band, height}, fill: fill, stroke: {1, {20, 24, 60}}, translate: {x, 0})
+
+      cond do
+        String.ends_with?(name, "#") -> graph
+        name == "C" -> label(graph, n, :white, {x + band / 2, height - 30})
+        true -> label(graph, n, {150, 160, 230}, {x + band / 2, height - 30})
+      end
     end)
   end
+
+  defp label(graph, n, fill, pos),
+    do: text(graph, note_name(@low * 2 ** (n / 12)), font_size: 30, fill: fill, text_align: :center, translate: pos)
 
   @impl Scenic.Scene
   def handle_input({:cursor_button, {_button, 1, _mods, pos}}, _id, scene), do: play(assign(scene, down: true), pos)
@@ -190,19 +214,23 @@ defmodule Theremin.Scene do
 
   def handle_input({:cursor_pos, pos}, _id, %{assigns: %{down: true}} = scene), do: play(scene, pos)
 
-  def handle_input({:key, {_key, 1, _mods}}, _id, scene) do
-    wave = Enum.at(@waves, rem(Enum.find_index(@waves, &(&1 == scene.assigns.wave)) + 1, length(@waves)))
+  # Only the volume keys: every touch also arrives as a :btn_touch key event.
+  def handle_input({:key, {key, 1, _mods}}, _id, scene) when key in [:key_volumeup, :key_volumedown] do
+    step = if key == :key_volumeup, do: 1, else: -1
+    wave = Enum.at(@waves, Integer.mod(Enum.find_index(@waves, &(&1 == scene.assigns.wave)) + step, length(@waves)))
     Synth.wave(wave)
 
     scene.assigns.graph
-    |> Graph.modify(:wave, &text(&1, "#{wave}: press a button to change"))
+    |> Graph.modify(:wave, &text(&1, "#{wave}: volume buttons change it"))
     |> show(assign(scene, wave: wave))
   end
 
   def handle_input(_input, _id, scene), do: {:noreply, scene}
 
-  defp play(scene, {x, y}) do
+  defp play(scene, {screen_x, screen_y}) do
     {width, height} = scene.assigns.size
+    # Touches arrive in portrait screen coordinates: turn them back into the canvas.
+    {x, y} = {screen_y, height - screen_x}
     freq = @low * 2 ** (@octaves * x / width)
     Synth.set(freq, 0.5 * (1 - y / height))
 
@@ -226,6 +254,11 @@ end
 
 Detach the IEx console from the screen, then start the pad. The synth
 has to be running (see above).
+
+The screen is 1080 × 2160 in portrait, and the driver only draws in
+portrait. So the scene draws on a 2160 × 1080 canvas and turns it a
+quarter turn onto the screen, and turns each touch back the other way.
+Hold the phone with the volume buttons on top.
 
 ```elixir
 fbcon =
