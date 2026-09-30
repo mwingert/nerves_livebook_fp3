@@ -3,8 +3,8 @@
 ## Overview
 
 Turn the screen into a theremin: slide a finger left and right to change
-the pitch, up and down to change the volume. The volume buttons switch
-the waveform.
+the pitch, up and down to change the volume. The `< sine >` arrows in
+the top bar, or the volume buttons, switch the waveform.
 
 Two parts work together:
 
@@ -143,8 +143,9 @@ The pitch slides smoothly between them, so a note is only in tune in
 the middle of its band. The top of the pad is loud and the bottom
 is silent.
 
-A bar across the top shows the note and its frequency. Its right side
-is left free for buttons; touching the bar doesn't play.
+A bar across the top shows the note and its frequency, and on the
+right `< sine >` arrows that step through the waveforms. Touching the
+bar doesn't play.
 
 ```elixir
 defmodule Theremin.Scene do
@@ -156,8 +157,12 @@ defmodule Theremin.Scene do
   @octaves 4
   @waves [:sine, :square, :saw]
   @names ~w(A A# B C C# D D# E F F# G G#)
-  # Height of the top bar: the note, the waveform, and room for buttons on the right.
+  # Height of the top bar: the note on the left, buttons on the right.
   @bar 200
+  # The waveform arrows: size, and each one's left edge counted from the right of the screen.
+  @arrow 140
+  @prev 640
+  @next 180
 
   @impl Scenic.Scene
   def init(scene, _param, _opts) do
@@ -174,7 +179,7 @@ defmodule Theremin.Scene do
           |> note_bands(width, height)
           |> rect({width, @bar}, fill: {10, 12, 30})
           |> text("Slide to play", id: :note, font_size: 80, fill: :white, translate: {40, 95})
-          |> text("sine: volume buttons change it", id: :wave, font_size: 36, fill: :light_gray, translate: {40, 165})
+          |> wave_selector(width)
           |> circle(60, id: :dot, fill: :yellow, hidden: true)
         end,
         rotate: -:math.pi() / 2,
@@ -218,13 +223,32 @@ defmodule Theremin.Scene do
   defp unlight(graph, nil), do: graph
   defp unlight(graph, n), do: paint(graph, n, dark(n))
 
+  # `< sine >`: the arrows are plain rects, hit-tested in handle_input/3.
+  defp wave_selector(graph, width) do
+    graph
+    |> arrow("<", width - @prev)
+    # Centred in the gap between the two arrows.
+    |> text("sine", id: :wave, font_size: 64, fill: :white, text_align: :center, translate: {width - (@prev - @arrow + @next) / 2, 122})
+    |> arrow(">", width - @next)
+  end
+
+  defp arrow(graph, sign, x) do
+    graph
+    |> rect({@arrow, @arrow}, fill: {40, 48, 110}, stroke: {2, {90, 100, 180}}, translate: {x, (@bar - @arrow) / 2})
+    |> text(sign, font_size: 80, fill: :white, text_align: :center, translate: {x + @arrow / 2, 128})
+  end
+
   defp label(graph, n, fill, pos),
     do: text(graph, note_name(@low * 2 ** (n / 12)), font_size: 30, fill: fill, text_align: :center, translate: pos)
 
   @impl Scenic.Scene
   def handle_input({:cursor_button, {_button, 1, _mods, pos}}, _id, scene) do
+    {width, _height} = scene.assigns.size
+
     case canvas(scene, pos) do
-      # The bar: reserved for buttons.
+      {x, y} when y < @bar and x >= width - @prev and x < width - @prev + @arrow -> switch_wave(scene, -1)
+      {x, y} when y < @bar and x >= width - @next and x < width - @next + @arrow -> switch_wave(scene, 1)
+      # The rest of the bar doesn't play.
       {_x, y} when y < @bar -> {:noreply, scene}
       pos -> play(assign(scene, down: true), pos)
     end
@@ -242,17 +266,20 @@ defmodule Theremin.Scene do
   def handle_input({:cursor_pos, pos}, _id, %{assigns: %{down: true}} = scene), do: play(scene, canvas(scene, pos))
 
   # Only the volume keys: every touch also arrives as a :btn_touch key event.
-  def handle_input({:key, {key, 1, _mods}}, _id, scene) when key in [:key_volumeup, :key_volumedown] do
-    step = if key == :key_volumeup, do: 1, else: -1
+  def handle_input({:key, {:key_volumeup, 1, _mods}}, _id, scene), do: switch_wave(scene, 1)
+  def handle_input({:key, {:key_volumedown, 1, _mods}}, _id, scene), do: switch_wave(scene, -1)
+
+  def handle_input(_input, _id, scene), do: {:noreply, scene}
+
+  # Step through @waves, wrapping around at both ends.
+  defp switch_wave(scene, step) do
     wave = Enum.at(@waves, Integer.mod(Enum.find_index(@waves, &(&1 == scene.assigns.wave)) + step, length(@waves)))
     Synth.wave(wave)
 
     scene.assigns.graph
-    |> Graph.modify(:wave, &text(&1, "#{wave}: volume buttons change it"))
+    |> Graph.modify(:wave, &text(&1, "#{wave}"))
     |> show(assign(scene, wave: wave))
   end
-
-  def handle_input(_input, _id, scene), do: {:noreply, scene}
 
   # Touches arrive in portrait screen coordinates: turn them back into the canvas.
   defp canvas(%{assigns: %{size: {width, _height}}}, {screen_x, screen_y}), do: {width - screen_y, screen_x}
