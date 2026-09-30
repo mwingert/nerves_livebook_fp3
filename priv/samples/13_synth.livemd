@@ -117,7 +117,8 @@ defmodule Synth do
       sweep: 0.0,
       low: 0.0,
       band: 0.0,
-      noise: 1
+      noise: 1,
+      pending: nil
     }
   end
 
@@ -128,6 +129,11 @@ defmodule Synth do
   the attack starts from the current envelope level, with the instrument chosen last. Volume 0 is a
   note off: the release starts, except for one-shot instruments, which play their decay to the end.
   """
+  # A new instrument on a voice that still rings: the old sound fades out over one chunk first
+  # (stage :fade), then the note starts. Switching sources mid-sound would click.
+  def note(v, freq, amp) when amp > 0 and not v.gate and v.stage != :idle and v.next_inst != v.inst,
+    do: %{v | gate: true, stage: :fade, pending: {freq, amp}}
+
   def note(v, freq, amp) when amp > 0 and not v.gate do
     fresh = v.stage == :idle
     inst = v.next_inst
@@ -145,11 +151,13 @@ defmodule Synth do
     }
   end
 
+  def note(%{stage: :fade} = v, freq, amp) when amp > 0, do: %{v | pending: {freq, amp}}
   def note(v, freq, amp) when amp > 0, do: %{v | freq: freq, amp: amp}
 
   def note(v, _freq, _amp) do
     cond do
-      @instruments[v.inst].one_shot or v.stage == :idle -> %{v | gate: false}
+      # Released during the fade: the pending note still plays (a quick drum tap), then gets its note off.
+      v.stage == :fade or @instruments[v.inst].one_shot or v.stage == :idle -> %{v | gate: false}
       true -> %{v | gate: false, stage: :release}
     end
   end
@@ -182,7 +190,7 @@ defmodule Synth do
         Map.update!(voices, id, &Map.merge(&1, Map.merge(env_state, %{phase: phase, phase2: phase2, low: low, band: band, noise: noise})))
       end)
 
-    voices = Map.new(voices, fn {id, v} -> {id, %{v | cur_freq: v.freq, cur_amp: v.amp}} end)
+    voices = Map.new(voices, fn {id, v} -> {id, v |> Map.merge(%{cur_freq: v.freq, cur_amp: v.amp}) |> start_pending()} end)
     {IO.iodata_to_binary(samples), voices}
   end
 
@@ -208,7 +216,16 @@ defmodule Synth do
     if env > 0.0005, do: {:release, env}, else: {:idle, 0.0}
   end
 
+  defp envelope(_i, :fade, _env, _n), do: {:idle, 0.0}
   defp envelope(_i, stage, env, _n), do: {stage, env}
+
+  # After a fade: start the note that waited, and release it at once if the finger already lifted.
+  defp start_pending(%{pending: {freq, amp}, stage: :idle, gate: gate} = v) do
+    v = note(%{v | pending: nil, gate: false}, freq, amp)
+    if gate, do: v, else: note(v, freq, 0)
+  end
+
+  defp start_pending(v), do: v
 
   defp factor(+0.0), do: 0.0
   defp factor(seconds), do: 0.01 ** (1 / (seconds * @rate))
@@ -386,7 +403,21 @@ v = Synth.note(Synth.voice(), 440, 0.5)
 v = %{v | next_inst: :bass}
 {_, v} = play.(v, 0.01)
 :sine = v.inst
-:bass = v |> Synth.note(440, 0) |> Synth.note(220, 0.5) |> Map.fetch!(:inst)
+# The next note starts after the old one faded out (one 5 ms chunk).
+{_, v} = play.(v |> Synth.note(440, 0) |> Synth.note(220, 0.5), 0.01)
+:bass = v.inst
+
+# Switching instrument while the old note still rings fades the old one out first: no jump, no click.
+bell = %{Synth.voice() | next_inst: :bell} |> Synth.note(110, 0.5)
+{_, bell} = play.(bell, 0.2)
+{before, ringing} = play.(Synth.note(bell, 110, 0), 0.05)
+{after_switch, v} = play.(%{ringing | next_inst: :kick} |> Synth.note(110, 0.5), 0.02)
+true = abs(hd(after_switch) - List.last(before)) < 500
+:kick = v.inst
+# A quick tap during that fade still plays the whole drum hit.
+tap = %{ringing | next_inst: :kick} |> Synth.note(110, 0.5) |> Synth.note(110, 0)
+{hit, v} = play.(tap, 0.05)
+true = v.inst == :kick and v.stage == :decay and Enum.any?(Enum.drop(hit, 240), &(abs(&1) > 100))
 
 # Noise and filters: hihat and bass make sound, and rendering the same state twice gives the same samples.
 for inst <- [:hihat, :bass, :snare, :bell, :pluck, :pad] do
