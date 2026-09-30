@@ -239,7 +239,7 @@ defmodule Theremin.Scene do
   end
 
   defp label(graph, n, fill, pos),
-    do: text(graph, note_name(@low * 2 ** (n / 12)), font_size: 30, fill: fill, text_align: :center, translate: pos)
+    do: text(graph, note_name(@low * 2 ** (n / 12)), font_size: 22, fill: fill, text_align: :center, translate: pos)
 
   @impl Scenic.Scene
   def handle_input({:cursor_button, {_button, 1, _mods, pos}}, _id, scene) do
