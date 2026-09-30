@@ -4,7 +4,8 @@
 
 Turn the screen into a theremin: slide a finger left and right to change
 the pitch, up and down to change the volume. The `< sine >` arrows in
-the top bar, or the volume buttons, switch the waveform.
+the top bar, or the volume buttons, switch between 10 instruments, from
+a plain sine to a bass, a bell and three drums.
 
 Three parts work together:
 
@@ -49,6 +50,14 @@ The synth has 5 voices: `:live` for the pad and `1` to `4` for the
 sequencer's tracks. Each chunk adds the sounding voices up sample by
 sample in one pass and skips silent ones, so an idle track costs almost
 nothing.
+
+Each voice plays an instrument: a sound source, an envelope and
+sometimes a filter. The envelope shapes every note: it rises during the
+attack, falls during the decay to the sustain level while you hold on,
+and fades out during the release after you lift your finger. Drums are
+one-shot: a tap plays the whole hit however short it is. The table of
+instruments is `@instruments`; `Synth.instrument(voice, name)` picks
+one, heard from the voice's next note.
 
 ```elixir
 defmodule Synth do
@@ -400,7 +409,7 @@ Synth.off(:live)
 ## The sequencer
 
 The sequencer has 4 tracks that share one loop length. A track stores
-what you played as a list of `{time_ms, frequency, volume, waveform}`
+what you played as a list of `{time_ms, frequency, volume, instrument}`
 events, not as sound. Every 10 ms it looks up, for each playing track,
 the last event at or before the current loop position and sends it to
 that track's voice in `Synth`, only when it changed.
@@ -621,7 +630,7 @@ the middle of its band. The top of the pad is loud and the bottom
 is silent.
 
 The bar across the top has two rows. The first shows the note and its
-frequency, and `< sine >` arrows that step through the waveforms. The
+frequency, and `< sine >` arrows that step through the instruments. The
 second runs the sequencer:
 
 * `1` to `4` select tracks; a yellow dot means the track has a take.
@@ -1040,7 +1049,7 @@ Try these:
 
 * Change `@low` or `@octaves` in the scene, run **Stop**, then run
   the scene and **Play** cells again.
-* Add a waveform of your own to `shape/2` in `Synth`.
+* Add an instrument of your own to `@instruments` in `Synth`, for example a triangle with a slow attack.
 * Record a bass line on track 1, then a melody on track 2 while it plays.
 * Replace the volume with the phone's tilt from the
   [Sensors](03_sensors.livemd) notebook.
