@@ -61,36 +61,155 @@ defmodule Synth do
   # The pad plays on :live, the sequencer's tracks on 1 to 4.
   @voices [:live, 1, 2, 3, 4]
 
+  # Each instrument: sound source, loudness, envelope times in seconds (attack, decay, release),
+  # sustain level, whether it ignores note off, and the second oscillator's pitch ratio.
+  @instruments [
+    sine: %{source: :sine, level: 1.0, a: 0.005, d: 0.0, s: 1.0, r: 0.05, one_shot: false, ratio: 0.0},
+    square: %{source: :square, level: 0.4, a: 0.005, d: 0.0, s: 1.0, r: 0.05, one_shot: false, ratio: 0.0},
+    saw: %{source: :saw, level: 0.6, a: 0.005, d: 0.0, s: 1.0, r: 0.05, one_shot: false, ratio: 0.0},
+    bass: %{source: :bass, level: 0.6, a: 0.005, d: 0.25, s: 0.3, r: 0.1, one_shot: false, ratio: 0.5},
+    pluck: %{source: :triangle, level: 0.8, a: 0.002, d: 0.4, s: 0.0, r: 0.1, one_shot: false, ratio: 0.0},
+    bell: %{source: :fm, level: 0.8, a: 0.002, d: 1.5, s: 0.0, r: 1.0, one_shot: false, ratio: 3.5},
+    pad: %{source: :square, level: 0.4, a: 0.4, d: 0.0, s: 1.0, r: 0.6, one_shot: false, ratio: 0.0},
+    kick: %{source: :kick, level: 1.0, a: 0.001, d: 0.3, s: 0.0, r: 0.0, one_shot: true, ratio: 0.0},
+    snare: %{source: :snare, level: 0.8, a: 0.001, d: 0.15, s: 0.0, r: 0.0, one_shot: true, ratio: 0.0},
+    hihat: %{source: :hihat, level: 0.8, a: 0.001, d: 0.05, s: 0.0, r: 0.0, one_shot: true, ratio: 0.0}
+  ]
+  @names Keyword.keys(@instruments)
+  # The kick's pitch sweep falls to 1 % in 0.1 s.
+  @sweep_factor 0.01 ** (1 / (0.1 * @rate))
+  @two_pi 2 * :math.pi()
+
   def start, do: GenServer.start(__MODULE__, nil, name: __MODULE__)
   def stop, do: GenServer.stop(__MODULE__)
 
-  @doc "Play `freq` Hz at volume `amp` (0.0 to 1.0) on `voice`."
+  @doc "The instrument names, in the order the pad's picker shows them."
+  def instruments, do: @names
+
+  @doc "Play `freq` Hz at volume `amp` (0.0 to 1.0) on `voice`. Volume 0 is note off."
   def set(voice, freq, amp) when voice in @voices, do: GenServer.cast(__MODULE__, {:set, voice, freq, amp |> max(0.0) |> min(1.0)})
   def off(voice) when voice in @voices, do: GenServer.cast(__MODULE__, {:off, voice})
-  def wave(voice, wave) when voice in @voices and wave in [:sine, :square, :saw], do: GenServer.cast(__MODULE__, {:wave, voice, wave})
+  @doc "The instrument `voice` uses from its next note on."
+  def instrument(voice, name) when voice in @voices and name in @names, do: GenServer.cast(__MODULE__, {:instrument, voice, name})
 
-  def voice, do: %{freq: 440.0, amp: 0.0, cur_freq: 440.0, cur_amp: 0.0, phase: 0.0, wave: :sine}
+  def voice do
+    %{
+      freq: 440.0,
+      amp: 0.0,
+      cur_freq: 440.0,
+      cur_amp: 0.0,
+      phase: 0.0,
+      phase2: 0.0,
+      inst: :sine,
+      next_inst: :sine,
+      gate: false,
+      stage: :idle,
+      env: 0.0,
+      sweep: 0.0,
+      low: 0.0,
+      band: 0.0,
+      noise: 1
+    }
+  end
+
   def initial, do: Map.new(@voices, &{&1, voice()})
+
+  @doc """
+  Applies a `set/3` to one voice's state. Volume above 0 on a voice that isn't gated is a note on:
+  the attack starts from the current envelope level, with the instrument chosen last. Volume 0 is a
+  note off: the release starts, except for one-shot instruments, which play their decay to the end.
+  """
+  def note(v, freq, amp) when amp > 0 and not v.gate do
+    fresh = v.stage == :idle
+    inst = v.next_inst
+
+    %{
+      v
+      | freq: freq,
+        amp: amp,
+        cur_freq: if(fresh, do: freq, else: v.cur_freq),
+        cur_amp: if(fresh, do: amp, else: v.cur_amp),
+        inst: inst,
+        gate: true,
+        stage: :attack,
+        sweep: if(inst == :kick, do: 1.0, else: 0.0)
+    }
+  end
+
+  def note(v, freq, amp) when amp > 0, do: %{v | freq: freq, amp: amp}
+
+  def note(v, _freq, _amp) do
+    cond do
+      @instruments[v.inst].one_shot or v.stage == :idle -> %{v | gate: false}
+      true -> %{v | gate: false, stage: :release}
+    end
+  end
 
   @doc "Renders `n` samples of all voices mixed, as S16_LE, and returns them with the updated voices."
   # Two ticks can land in the same sample after a stall; the ramps below would divide by zero.
   def render(voices, 0), do: {<<>>, voices}
 
   def render(voices, n) do
-    # Silent voices cost nothing. Each sounding voice becomes a tuple that is advanced once per sample:
-    # {id, phase, phase step, change of the phase step, amp, change of amp, wave}.
-    oscs =
-      for {id, v} <- voices, v.amp != 0 or v.cur_amp != 0 do
-        {id, v.phase, v.cur_freq / @rate, (v.freq - v.cur_freq) / (@rate * n), v.cur_amp, (v.amp - v.cur_amp) / n, v.wave}
+    # Idle voices cost nothing. The envelope and the kick's pitch sweep move once per chunk and glide
+    # across it, like volume and pitch. Each sounding voice becomes a tuple advanced once per sample.
+    chunk =
+      for {id, v} <- voices, v.stage != :idle, into: %{} do
+        i = @instruments[v.inst]
+        {stage, env} = envelope(i, v.stage, v.env, n)
+        sweep = v.sweep * @sweep_factor ** n
+        gain = v.cur_amp * v.env * i.level
+        dp = v.cur_freq * (1 + 2 * v.sweep) / @rate
+        dp_end = v.freq * (1 + 2 * sweep) / @rate
+        k = {i.source, i.ratio, filter(i.source, (v.env + env) / 2), (dp_end - dp) / n, (v.amp * env * i.level - gain) / n, id}
+        {id, {%{stage: stage, env: env, sweep: sweep}, {k, v.phase, dp, v.phase2, gain, v.low, v.band, v.noise}}}
       end
 
-    {samples, oscs} = mix(oscs, n, [])
-    phases = Map.new(oscs, fn {id, phase, _, _, _, _, _} -> {id, phase} end)
-    voices = Map.new(voices, fn {id, v} -> {id, %{v | phase: Map.get(phases, id, v.phase), cur_freq: v.freq, cur_amp: v.amp}} end)
+    {samples, oscs} = mix(Enum.map(chunk, fn {_id, {_, osc}} -> osc end), n, [])
+
+    voices =
+      Enum.reduce(oscs, voices, fn {k, phase, _dp, phase2, _gain, low, band, noise}, voices ->
+        id = elem(k, 5)
+        {env_state, _} = chunk[id]
+        Map.update!(voices, id, &Map.merge(&1, Map.merge(env_state, %{phase: phase, phase2: phase2, low: low, band: band, noise: noise})))
+      end)
+
+    voices = Map.new(voices, fn {id, v} -> {id, %{v | cur_freq: v.freq, cur_amp: v.amp}} end)
     {IO.iodata_to_binary(samples), voices}
   end
 
-  # ponytail: one pass in plain Elixir, ~19 % of a core for 5 voices on the phone; Nx or a NIF if more voices are needed.
+  # The envelope after `n` more samples: {stage, level}. Decay and release are exponential and reach
+  # 1 % of their starting distance at the instrument's stated time.
+  defp envelope(i, :attack, env, n) do
+    env = env + n / (i.a * @rate)
+    if env >= 1.0, do: {:decay, 1.0}, else: {:attack, env}
+  end
+
+  defp envelope(i, :decay, env, n) do
+    env = i.s + (env - i.s) * factor(i.d) ** n
+
+    cond do
+      env - i.s > 0.001 -> {:decay, env}
+      i.s == 0 -> {:idle, 0.0}
+      true -> {:sustain, i.s}
+    end
+  end
+
+  defp envelope(i, :release, env, n) do
+    env = env * factor(i.r) ** n
+    if env > 0.0005, do: {:release, env}, else: {:idle, 0.0}
+  end
+
+  defp envelope(_i, stage, env, _n), do: {stage, env}
+
+  defp factor(+0.0), do: 0.0
+  defp factor(seconds), do: 0.01 ** (1 / (seconds * @rate))
+
+  # Filter coefficients (Chamberlin state-variable filter): the bass's cutoff follows the envelope.
+  defp filter(:bass, env), do: @two_pi * (200 + 2500 * env) / @rate
+  defp filter(:hihat, _env), do: 2 * :math.sin(:math.pi() * 7000 / @rate)
+  defp filter(_source, _env), do: 0.0
+
+  # ponytail: one pass in plain Elixir; Nx or a NIF if more voices or heavier instruments are needed.
   defp mix(oscs, 0, acc), do: {Enum.reverse(acc), oscs}
 
   defp mix(oscs, left, acc) do
@@ -99,17 +218,59 @@ defmodule Synth do
     mix(oscs, left - 1, [<<sample::signed-little-16>> | acc])
   end
 
+  # Each source computes its sample and only the state it needs, then hands on to the next voice.
   defp step([], sum, oscs), do: {sum, oscs}
+  defp step([{k, _, _, _, _, _, _, _} = osc | rest], sum, oscs), do: voice(elem(k, 0), osc, rest, sum, oscs)
 
-  defp step([{id, phase, dp, ddp, amp, damp, wave} | rest], sum, oscs) do
-    next = phase + dp
-    step(rest, sum + amp * shape(wave, phase), [{id, next - trunc(next), dp + ddp, ddp, amp + damp, damp, wave} | oscs])
+  defp voice(:sine, {_, phase, _, _, gain, _, _, _} = o, rest, sum, oscs),
+    do: step(rest, sum + gain * :math.sin(@two_pi * phase), [move(o) | oscs])
+
+  defp voice(:kick, {_, phase, _, _, gain, _, _, _} = o, rest, sum, oscs),
+    do: step(rest, sum + gain * :math.sin(@two_pi * phase), [move(o) | oscs])
+
+  defp voice(:square, {_, phase, _, _, gain, _, _, _} = o, rest, sum, oscs), do: step(rest, sum + gain * square(phase), [move(o) | oscs])
+  defp voice(:saw, {_, phase, _, _, gain, _, _, _} = o, rest, sum, oscs), do: step(rest, sum + gain * (2 * phase - 1), [move(o) | oscs])
+
+  defp voice(:triangle, {_, phase, _, _, gain, _, _, _} = o, rest, sum, oscs),
+    do: step(rest, sum + gain * triangle(phase), [move(o) | oscs])
+
+  # Bell: FM, a sine whose phase is pushed around by a second sine; the push fades with the envelope.
+  defp voice(:fm, {{_, ratio, _, _, _, _} = k, phase, dp, phase2, gain, low, band, noise}, rest, sum, oscs) do
+    out = :math.sin(@two_pi * phase + 2 * gain * :math.sin(@two_pi * phase2))
+    step(rest, sum + gain * out, [move({k, phase, dp, wrap(phase2 + dp * ratio), gain, low, band, noise}) | oscs])
   end
 
-  defp shape(:sine, phase), do: :math.sin(2 * :math.pi() * phase)
-  # Square and saw are much louder than a sine at the same amplitude.
-  defp shape(:square, phase), do: if(phase < 0.5, do: 0.4, else: -0.4)
-  defp shape(:saw, phase), do: 0.6 * (2 * phase - 1)
+  # Bass: saw plus a square one octave down, low-passed.
+  defp voice(:bass, {{_, ratio, f, _, _, _} = k, phase, dp, phase2, gain, low, band, noise}, rest, sum, oscs) do
+    low = low + f * band
+    band = f * (2 * phase - 1 + 0.5 * square(phase2) - low - 0.5 * band) + band
+    step(rest, sum + gain * low, [move({k, phase, dp, wrap(phase2 + dp * ratio), gain, low, band, noise}) | oscs])
+  end
+
+  defp voice(:snare, {k, phase, dp, phase2, gain, low, band, noise}, rest, sum, oscs) do
+    noise = next_noise(noise)
+    out = 0.6 * (noise / 8_388_608 - 1) + 0.4 * triangle(phase)
+    step(rest, sum + gain * out, [move({k, phase, dp, phase2, gain, low, band, noise}) | oscs])
+  end
+
+  # Hi-hat: noise with the lows filtered out.
+  defp voice(:hihat, {{_, _, f, _, _, _} = k, phase, dp, phase2, gain, low, band, noise}, rest, sum, oscs) do
+    noise = next_noise(noise)
+    low = low + f * band
+    high = noise / 8_388_608 - 1 - low - band
+    step(rest, sum + gain * high, [move({k, phase, dp, phase2, gain, low, f * high + band, noise}) | oscs])
+  end
+
+  # Advances phase, pitch and gain by one sample.
+  defp move({{_, _, _, ddp, dgain, _id} = k, phase, dp, phase2, gain, low, band, noise}),
+    do: {k, wrap(phase + dp), dp + ddp, phase2, gain + dgain, low, band, noise}
+
+  defp wrap(phase), do: phase - trunc(phase)
+  # A small linear congruential generator: deterministic noise, kept in the voice's state.
+  defp next_noise(x), do: rem(x * 1_140_671_485 + 12_820_163, 16_777_216)
+
+  defp square(phase), do: if(phase < 0.5, do: 1.0, else: -1.0)
+  defp triangle(phase), do: 1 - 4 * abs(phase - 0.5)
 
   @impl GenServer
   def init(nil) do
@@ -120,9 +281,9 @@ defmodule Synth do
   end
 
   @impl GenServer
-  def handle_cast({:set, voice, freq, amp}, s), do: {:noreply, update_voice(s, voice, &%{&1 | freq: freq, amp: amp})}
-  def handle_cast({:off, voice}, s), do: {:noreply, update_voice(s, voice, &%{&1 | amp: 0.0})}
-  def handle_cast({:wave, voice, wave}, s), do: {:noreply, update_voice(s, voice, &%{&1 | wave: wave})}
+  def handle_cast({:set, voice, freq, amp}, s), do: {:noreply, update_voice(s, voice, &note(&1, freq, amp))}
+  def handle_cast({:off, voice}, s), do: {:noreply, update_voice(s, voice, &note(&1, &1.freq, 0.0))}
+  def handle_cast({:instrument, voice, name}, s), do: {:noreply, update_voice(s, voice, &%{&1 | next_inst: name})}
 
   defp update_voice(s, voice, fun), do: %{s | voices: Map.update!(s.voices, voice, fun)}
 
@@ -142,40 +303,89 @@ defmodule Synth do
 end
 ```
 
-A quick check of `render/2`: chunks join without a jump, silence renders
-as zeros, two voices add up, and five loud voices are clamped instead of
-wrapping around.
+A quick check of `render/2`: chunks join without a jump, voices mix and
+clamp, envelopes rise and fall, drums play out, and a new instrument
+waits for the next note.
 
 ```elixir
-# Check: Synth.render/2 joins chunks seamlessly, renders silence as zeros, and mixes voices.
-one = fn wave, amp -> %{Synth.voice() | wave: wave, amp: amp, cur_amp: amp} end
+# Check: Synth.render/2 joins chunks, mixes and clamps voices, and plays envelopes, drums and instrument changes.
 silent = Synth.initial()
 decode = fn bin -> for <<x::signed-little-16 <- bin>>, do: x end
+# A voice already holding a note at full envelope, as if it had been playing a while.
+held = fn inst, amp -> %{Synth.voice() | inst: inst, amp: amp, cur_amp: amp, gate: true, stage: :sustain, env: 1.0} end
+# Renders `seconds` of one voice on :live in 5 ms chunks, like the running synth, and returns its samples and new state.
+play = fn v, seconds ->
+  Enum.reduce(1..round(seconds * 200)//1, {[], v}, fn _, {samples, v} ->
+    {bin, voices} = Synth.render(%{silent | live: v}, 240)
+    {samples ++ decode.(bin), voices.live}
+  end)
+end
 
 # Two chunks of 100 samples join into exactly the same wave as one chunk of 200.
-{a, s1} = Synth.render(%{silent | live: one.(:sine, 0.5)}, 100)
+{a, s1} = Synth.render(%{silent | live: held.(:sine, 0.5)}, 100)
 {b, _} = Synth.render(s1, 100)
-{whole, _} = Synth.render(%{silent | live: one.(:sine, 0.5)}, 200)
+{whole, _} = Synth.render(%{silent | live: held.(:sine, 0.5)}, 200)
 true = byte_size(a) == 200
 true = a <> b == whole
 
-# Only silent voices: 100 samples of zero.
+# Only idle voices: 100 samples of zero. A 0-sample chunk renders nothing.
 {zeros, _} = Synth.render(silent, 100)
 true = zeros == <<0::size(1600)>>
+{<<>>, _} = Synth.render(%{silent | live: held.(:sine, 0.5)}, 0)
 
 # Two voices mix to the sum of each alone (±1 for rounding).
-{live, _} = Synth.render(%{silent | live: one.(:saw, 0.5)}, 100)
-{track, _} = Synth.render(%{silent | 1 => one.(:square, 0.5)}, 100)
-{both, _} = Synth.render(%{silent | :live => one.(:saw, 0.5), 1 => one.(:square, 0.5)}, 100)
+{live, _} = Synth.render(%{silent | live: held.(:saw, 0.5)}, 100)
+{track, _} = Synth.render(%{silent | 1 => held.(:square, 0.5)}, 100)
+{both, _} = Synth.render(%{silent | :live => held.(:saw, 0.5), 1 => held.(:square, 0.5)}, 100)
 sums = Enum.zip_with(decode.(live), decode.(track), &(&1 + &2))
 true = Enum.zip(sums, decode.(both)) |> Enum.all?(fn {sum, mixed} -> abs(sum - mixed) <= 1 end)
 
-# A 0-sample chunk (two ticks back to back after a stall) renders nothing instead of crashing.
-{<<>>, _} = Synth.render(%{silent | live: one.(:sine, 0.5)}, 0)
+# Each voice keeps its own state across an odd-length chunk: 101 samples at 440 Hz and at 220 Hz.
+low = %{held.(:saw, 0.5) | freq: 220.0, cur_freq: 220.0}
+{_, after_odd} = Synth.render(%{silent | :live => held.(:sine, 0.5), 1 => low}, 101)
+true = abs(after_odd.live.phase - 101 * 440 / 48_000) < 1.0e-9
+true = abs(after_odd[1].phase - 101 * 220 / 48_000) < 1.0e-9
 
 # Five loud voices clamp to full scale instead of wrapping around.
-{loud, _} = Synth.render(Map.new(silent, fn {id, _} -> {id, one.(:square, 1.0)} end), 10)
+{loud, _} = Synth.render(Map.new(silent, fn {id, _} -> {id, held.(:square, 1.0)} end), 10)
 true = Enum.all?(decode.(loud), &(abs(&1) == 32_767))
+
+# Envelope: a sine reaches full level after its 5 ms attack, and after note off it falls under 1 %
+# within its 50 ms release, then goes idle and renders zeros.
+{_, v} = play.(Synth.note(Synth.voice(), 440, 0.5), 0.006)
+true = v.stage in [:decay, :sustain] and v.env >= 0.99
+{_, v} = play.(Synth.note(v, 440, 0), 0.05)
+true = v.env < 0.011
+{_, v} = play.(v, 0.05)
+:idle = v.stage
+{tail, _} = play.(v, 0.01)
+true = Enum.all?(tail, &(&1 == 0))
+
+# One-shot: a kick released right after it starts still plays its decay (1 % at 0.3 s), then goes idle.
+kick = %{Synth.voice() | next_inst: :kick} |> Synth.note(110, 0.5) |> Synth.note(110, 0)
+{hit, v} = play.(kick, 0.1)
+true = Enum.any?(Enum.drop(hit, 4_000), &(abs(&1) > 100)) and v.stage == :decay
+{_, v} = play.(v, 0.4)
+:idle = v.stage
+
+# Retrigger: tapping a drum again while it still rings restarts its attack.
+{_, ringing} = play.(kick, 0.05)
+:attack = ringing |> Synth.note(110, 0.5) |> Map.fetch!(:stage)
+
+# Instrument change: takes effect at the next note on, not in the middle of a note.
+v = Synth.note(Synth.voice(), 440, 0.5)
+v = %{v | next_inst: :bass}
+{_, v} = play.(v, 0.01)
+:sine = v.inst
+:bass = v |> Synth.note(440, 0) |> Synth.note(220, 0.5) |> Map.fetch!(:inst)
+
+# Noise and filters: hihat and bass make sound, and rendering the same state twice gives the same samples.
+for inst <- [:hihat, :bass, :snare, :bell, :pluck, :pad] do
+  v = Synth.note(%{Synth.voice() | next_inst: inst}, 220, 0.5)
+  {first, _} = play.(v, 0.05)
+  {again, _} = play.(v, 0.05)
+  true = first == again and Enum.any?(first, &(abs(&1) > 100))
+end
 ```
 
 Start it and play a note for one second:
@@ -219,7 +429,7 @@ defmodule Sequencer do
   def stop, do: call(:stop, :not_running)
   def clear(ids), do: call({:clear, ids}, :not_running)
   @doc "The pad's current sound. Kept in the take while recording, ignored otherwise."
-  def touch(freq, amp, wave), do: GenServer.cast(__MODULE__, {:touch, freq, amp, wave})
+  def touch(freq, amp, instrument), do: GenServer.cast(__MODULE__, {:touch, freq, amp, instrument})
   def status, do: call(:status, %{mode: :idle, position_ms: 0, length_ms: 8_000, filled: [], sounding: []})
 
   # Without a running sequencer, calls return `fallback`, so the pad keeps working instead of crashing.
@@ -264,15 +474,15 @@ defmodule Sequencer do
 
   def handle_call(:status, _from, s) do
     # What the playing tracks sound like right now, so the pad can light their bands.
-    sounding = for({_id, {_t, freq, amp, _wave}} <- s.sent, amp > 0, do: {freq, amp}) |> Enum.sort()
+    sounding = for({_id, {_t, freq, amp, _instrument}} <- s.sent, amp > 0, do: {freq, amp}) |> Enum.sort()
     {:reply, %{mode: s.mode, position_ms: position(s), length_ms: s.length_ms, filled: filled(s), sounding: sounding}, s}
   end
 
   @impl GenServer
-  def handle_cast({:touch, freq, amp, wave}, %{mode: {:recording, _, _}} = s),
-    do: {:noreply, %{s | take: [{position(s), freq, amp, wave} | s.take]}}
+  def handle_cast({:touch, freq, amp, instrument}, %{mode: {:recording, _, _}} = s),
+    do: {:noreply, %{s | take: [{position(s), freq, amp, instrument} | s.take]}}
 
-  def handle_cast({:touch, _freq, _amp, _wave}, s), do: {:noreply, s}
+  def handle_cast({:touch, _freq, _amp, _instrument}, s), do: {:noreply, s}
 
   @impl GenServer
   def handle_info(:tick, %{mode: :idle} = s), do: {:noreply, s}
@@ -307,8 +517,8 @@ defmodule Sequencer do
 
   defp voice(id, nil), do: Synth.off(id)
 
-  defp voice(id, {_t, freq, amp, wave}) do
-    Synth.wave(id, wave)
+  defp voice(id, {_t, freq, amp, instrument}) do
+    Synth.instrument(id, instrument)
     Synth.set(id, freq, amp)
   end
 
@@ -434,9 +644,8 @@ defmodule Theremin.Scene do
 
   @low 110
   @octaves 4
-  @waves [:sine, :square, :saw]
   @names ~w(A A# B C C# D D# E F F# G G#)
-  # Height of the top bar. Row 1: the note and the waveform arrows. Row 2: the sequencer.
+  # Height of the top bar. Row 1: the note and the instrument arrows. Row 2: the sequencer.
   @bar 320
   # Every button is a square this size.
   @button 130
@@ -465,7 +674,7 @@ defmodule Theremin.Scene do
           |> note_bands(width, height)
           |> rect({width, @bar}, fill: {10, 12, 30})
           |> text("Slide to play", id: :note, font_size: 80, fill: :white, translate: {40, 105})
-          |> text("sine", id: :wave, font_size: 64, fill: :white, text_align: :center, translate: {width - 320, 96})
+          |> text("sine", id: :instrument, font_size: 64, fill: :white, text_align: :center, translate: {width - 320, 96})
           |> draw_buttons(width)
           |> text("8 s", id: :length, font_size: 56, fill: :white, text_align: :center, translate: {1410, 255})
           |> progress_cells()
@@ -484,7 +693,7 @@ defmodule Theremin.Scene do
         graph: graph,
         size: {width, height},
         down: false,
-        wave: :sine,
+        instrument: :sine,
         freq: 440.0,
         lit: nil,
         selected: MapSet.new(),
@@ -539,8 +748,8 @@ defmodule Theremin.Scene do
 
     tracks ++
       [
-        {:wave_prev, {width - 600, 10}, "<"},
-        {:wave_next, {width - 170, 10}, ">"},
+        {:instrument_prev, {width - 600, 10}, "<"},
+        {:instrument_next, {width - 170, 10}, ">"},
         {:rec, {700, 170}, "REC"},
         {:play, {850, 170}, "PLAY"},
         {:stop, {1000, 170}, "STOP"},
@@ -601,7 +810,7 @@ defmodule Theremin.Scene do
   def handle_input({:cursor_button, {_button, 0, _mods, _pos}}, _id, scene) do
     Synth.off(:live)
     # The release goes into the take too, so it has silence where you lifted your finger.
-    if scene.assigns.down, do: Sequencer.touch(scene.assigns.freq, 0.0, scene.assigns.wave)
+    if scene.assigns.down, do: Sequencer.touch(scene.assigns.freq, 0.0, scene.assigns.instrument)
 
     scene.assigns.graph
     |> unlight(scene.assigns.lit)
@@ -613,16 +822,16 @@ defmodule Theremin.Scene do
   def handle_input({:cursor_pos, pos}, _id, %{assigns: %{down: true}} = scene), do: play(scene, canvas(scene, pos))
 
   # Only the volume keys: every touch also arrives as a :btn_touch key event.
-  def handle_input({:key, {:key_volumeup, 1, _mods}}, _id, scene), do: switch_wave(scene, 1)
-  def handle_input({:key, {:key_volumedown, 1, _mods}}, _id, scene), do: switch_wave(scene, -1)
+  def handle_input({:key, {:key_volumeup, 1, _mods}}, _id, scene), do: switch_instrument(scene, 1)
+  def handle_input({:key, {:key_volumedown, 1, _mods}}, _id, scene), do: switch_instrument(scene, -1)
 
   def handle_input(_input, _id, scene), do: {:noreply, scene}
 
   @impl GenServer
   def handle_info(:refresh, scene), do: refresh(scene)
 
-  defp press(scene, :wave_prev), do: switch_wave(scene, -1)
-  defp press(scene, :wave_next), do: switch_wave(scene, 1)
+  defp press(scene, :instrument_prev), do: switch_instrument(scene, -1)
+  defp press(scene, :instrument_next), do: switch_instrument(scene, 1)
 
   defp press(scene, {:track, id}) do
     selected = scene.assigns.selected
@@ -753,14 +962,15 @@ defmodule Theremin.Scene do
   defp echo(graph, nil), do: graph
   defp echo(graph, view), do: Enum.reduce(view.echo, graph, fn {n, fill}, graph -> paint(graph, n, fill) end)
 
-  # Step through @waves, wrapping around at both ends.
-  defp switch_wave(scene, step) do
-    wave = Enum.at(@waves, Integer.mod(Enum.find_index(@waves, &(&1 == scene.assigns.wave)) + step, length(@waves)))
-    Synth.wave(:live, wave)
+  # Step through Synth's instruments, wrapping around at both ends. Heard from the next touch on.
+  defp switch_instrument(scene, step) do
+    names = Synth.instruments()
+    instrument = Enum.at(names, Integer.mod(Enum.find_index(names, &(&1 == scene.assigns.instrument)) + step, length(names)))
+    Synth.instrument(:live, instrument)
 
     scene.assigns.graph
-    |> Graph.modify(:wave, &text(&1, "#{wave}"))
-    |> show(assign(scene, wave: wave))
+    |> Graph.modify(:instrument, &text(&1, "#{instrument}"))
+    |> show(assign(scene, instrument: instrument))
   end
 
   # Touches arrive in portrait screen coordinates: turn them back into the canvas.
@@ -774,7 +984,7 @@ defmodule Theremin.Scene do
     freq = @low * 2 ** (@octaves * x / width)
     amp = 0.5 * (1 - quiet)
     Synth.set(:live, freq, amp)
-    Sequencer.touch(freq, amp, scene.assigns.wave)
+    Sequencer.touch(freq, amp, scene.assigns.instrument)
     lit = round(12 * @octaves * x / width)
 
     # Recoloured on every move: the colour follows the volume.
