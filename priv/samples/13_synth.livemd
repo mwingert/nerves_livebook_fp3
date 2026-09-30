@@ -153,8 +153,6 @@ defmodule Theremin.Scene do
   @octaves 4
   @waves [:sine, :square, :saw]
   @names ~w(A A# B C C# D D# E F F# G G#)
-  # Band colours by {sharp?, lit?}: the note under the finger lights up.
-  @fills %{{false, false} => {30, 36, 84}, {true, false} => {12, 14, 36}, {false, true} => {110, 140, 255}, {true, true} => {80, 100, 210}}
 
   @impl Scenic.Scene
   def init(scene, _param, _opts) do
@@ -190,7 +188,7 @@ defmodule Theremin.Scene do
       name = Enum.at(@names, Integer.mod(n, 12))
       x = band * (n - 0.5)
       sharp = String.ends_with?(name, "#")
-      graph = rect(graph, {band, height}, id: {:band, n}, fill: @fills[{sharp, false}], stroke: {1, {20, 24, 60}}, translate: {x, 0})
+      graph = rect(graph, {band, height}, id: {:band, n}, fill: dark(n), stroke: {1, {20, 24, 60}}, translate: {x, 0})
 
       cond do
         sharp -> graph
@@ -200,12 +198,19 @@ defmodule Theremin.Scene do
     end)
   end
 
-  defp light(graph, nil, _lit), do: graph
+  # Unlit bands: sharps darker, like piano keys.
+  defp dark(n), do: if(String.ends_with?(Enum.at(@names, Integer.mod(n, 12)), "#"), do: {12, 14, 36}, else: {30, 36, 84})
 
-  defp light(graph, n, lit) do
-    sharp = String.ends_with?(Enum.at(@names, Integer.mod(n, 12)), "#")
-    Graph.modify(graph, {:band, n}, &Scenic.Primitive.put_style(&1, :fill, @fills[{sharp, lit}]))
+  # Fire gradient by volume: red when loud (top), through orange, to yellow when quiet (bottom).
+  defp fire(t) do
+    t = t |> max(0) |> min(1)
+    {round(180 + 75 * min(2 * t, 1)), round(220 * t), 0}
   end
+
+  defp paint(graph, n, fill), do: Graph.modify(graph, {:band, n}, &Scenic.Primitive.put_style(&1, :fill, fill))
+
+  defp unlight(graph, nil), do: graph
+  defp unlight(graph, n), do: paint(graph, n, dark(n))
 
   defp label(graph, n, fill, pos),
     do: text(graph, note_name(@low * 2 ** (n / 12)), font_size: 30, fill: fill, text_align: :center, translate: pos)
@@ -217,7 +222,7 @@ defmodule Theremin.Scene do
     Synth.off()
 
     scene.assigns.graph
-    |> light(scene.assigns.lit, false)
+    |> unlight(scene.assigns.lit)
     |> Graph.modify(:dot, &circle(&1, 60, hidden: true))
     |> show(assign(scene, down: false, lit: nil))
   end
@@ -245,16 +250,14 @@ defmodule Theremin.Scene do
     Synth.set(freq, 0.5 * (1 - y / height))
     lit = round(12 * @octaves * x / width)
 
+    # Recoloured on every move: the colour follows the volume.
     scene.assigns.graph
-    |> relight(scene.assigns.lit, lit)
+    |> then(&if(scene.assigns.lit == lit, do: &1, else: unlight(&1, scene.assigns.lit)))
+    |> paint(lit, fire(y / height))
     |> Graph.modify(:dot, &circle(&1, 60, translate: {x, y}, hidden: false))
     |> Graph.modify(:note, &text(&1, "#{note_name(freq)}  #{round(freq)} Hz"))
     |> show(assign(scene, lit: lit))
   end
-
-  # Only recolour when the finger crosses into another note.
-  defp relight(graph, same, same), do: graph
-  defp relight(graph, old, new), do: graph |> light(old, false) |> light(new, true)
 
   # The nearest note, counted in semitones from A4 (440 Hz).
   defp note_name(freq) do
