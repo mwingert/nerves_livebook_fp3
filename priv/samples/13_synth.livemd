@@ -394,9 +394,21 @@ The pitch slides smoothly between them, so a note is only in tune in
 the middle of its band. The top of the pad is loud and the bottom
 is silent.
 
-A bar across the top shows the note and its frequency, and on the
-right `< sine >` arrows that step through the waveforms. Touching the
-bar doesn't play.
+The bar across the top has two rows. The first shows the note and its
+frequency, and `< sine >` arrows that step through the waveforms. The
+second runs the sequencer:
+
+* `1` to `4` select tracks; a yellow dot means the track has a take.
+* `REC` records one loop into the selected track. It needs exactly one
+  selected track and turns red while recording.
+* `PLAY` loops the selected tracks, or every track with a take when
+  none is selected, until `STOP`.
+* `-` and `+` set the loop length, 1 to 30 s, while nothing runs.
+* `DEL` clears the selected tracks after a second tap within 2 s.
+* The 8 cells on the right show where the loop is.
+
+Touching the bar doesn't play. Bands light up for the tracks playing
+back as well as for your finger.
 
 ```elixir
 defmodule Theremin.Scene do
@@ -408,12 +420,19 @@ defmodule Theremin.Scene do
   @octaves 4
   @waves [:sine, :square, :saw]
   @names ~w(A A# B C C# D D# E F F# G G#)
-  # Height of the top bar: the note on the left, buttons on the right.
-  @bar 200
-  # The waveform arrows: size, and each one's left edge counted from the right of the screen.
-  @arrow 140
-  @prev 640
-  @next 180
+  # Height of the top bar. Row 1: the note and the waveform arrows. Row 2: the sequencer.
+  @bar 320
+  # Every button is a square this size.
+  @button 130
+  # Button colours.
+  @idle {40, 48, 110}
+  @dim {22, 26, 50}
+  @selected {90, 110, 230}
+  @red {200, 30, 30}
+  @green {30, 150, 60}
+  # Loop position cells.
+  @cell_on {140, 170, 255}
+  @cell_off {30, 36, 84}
 
   @impl Scenic.Scene
   def init(scene, _param, _opts) do
@@ -429,8 +448,11 @@ defmodule Theremin.Scene do
           |> rect({width, height}, fill: {20, 24, 60})
           |> note_bands(width, height)
           |> rect({width, @bar}, fill: {10, 12, 30})
-          |> text("Slide to play", id: :note, font_size: 80, fill: :white, translate: {40, 95})
-          |> wave_selector(width)
+          |> text("Slide to play", id: :note, font_size: 80, fill: :white, translate: {40, 105})
+          |> text("sine", id: :wave, font_size: 64, fill: :white, text_align: :center, translate: {width - 320, 96})
+          |> draw_buttons(width)
+          |> text("8 s", id: :length, font_size: 56, fill: :white, text_align: :center, translate: {1410, 255})
+          |> progress_cells()
           |> circle(60, id: :dot, fill: :yellow, hidden: true)
         end,
         rotate: -:math.pi() / 2,
@@ -438,7 +460,25 @@ defmodule Theremin.Scene do
       )
 
     request_input(scene, [:cursor_button, :cursor_pos, :key])
-    {:ok, scene |> assign(graph: graph, size: {width, height}, down: false, wave: :sine, lit: nil) |> push_graph(graph)}
+    # Polls the sequencer, so the bar notices when a recording ends by itself.
+    :timer.send_interval(100, :refresh)
+
+    scene =
+      assign(scene,
+        graph: graph,
+        size: {width, height},
+        down: false,
+        wave: :sine,
+        freq: 440.0,
+        lit: nil,
+        selected: MapSet.new(),
+        delete_armed_at: nil,
+        status: Sequencer.status(),
+        view: nil
+      )
+
+    {:noreply, scene} = redraw(scene)
+    {:ok, scene}
   end
 
   # One band per note, centred on its pitch: sharps dark like piano keys, naturals labelled.
@@ -474,42 +514,82 @@ defmodule Theremin.Scene do
   defp unlight(graph, nil), do: graph
   defp unlight(graph, n), do: paint(graph, n, dark(n))
 
-  # `< sine >`: the arrows are plain rects, hit-tested in handle_input/3.
-  defp wave_selector(graph, width) do
-    graph
-    |> arrow("<", width - @prev)
-    # Centred in the gap between the two arrows.
-    |> text("sine", id: :wave, font_size: 64, fill: :white, text_align: :center, translate: {width - (@prev - @arrow + @next) / 2, 122})
-    |> arrow(">", width - @next)
-  end
-
-  defp arrow(graph, sign, x) do
-    graph
-    |> rect({@arrow, @arrow}, fill: {40, 48, 110}, stroke: {2, {90, 100, 180}}, translate: {x, (@bar - @arrow) / 2})
-    |> text(sign, font_size: 80, fill: :white, text_align: :center, translate: {x + @arrow / 2, 128})
-  end
-
   defp label(graph, n, fill, pos),
     do: text(graph, note_name(@low * 2 ** (n / 12)), font_size: 22, fill: fill, text_align: :center, translate: pos)
+
+  # Every button as {id, {x, y}, label}. The same list draws them and hit-tests touches.
+  defp buttons(width) do
+    tracks = for id <- 1..4, do: {{:track, id}, {track_x(id), 170}, "#{id}"}
+
+    tracks ++
+      [
+        {:wave_prev, {width - 600, 10}, "<"},
+        {:wave_next, {width - 170, 10}, ">"},
+        {:rec, {700, 170}, "REC"},
+        {:play, {850, 170}, "PLAY"},
+        {:stop, {1000, 170}, "STOP"},
+        {:shorter, {1200, 170}, "-"},
+        {:longer, {1490, 170}, "+"},
+        {:delete, {1680, 170}, "DEL"}
+      ]
+  end
+
+  defp track_x(id), do: 40 + (id - 1) * 150
+
+  defp draw_buttons(graph, width) do
+    graph =
+      Enum.reduce(buttons(width), graph, fn {id, {x, y}, label}, graph ->
+        size = if String.length(label) == 1, do: 72, else: 40
+
+        graph
+        |> rect({@button, @button}, id: {:bg, id}, fill: @idle, stroke: {2, {90, 100, 180}}, translate: {x, y})
+        |> text(label,
+          id: {:label, id},
+          font_size: size,
+          fill: :white,
+          text_align: :center,
+          translate: {x + @button / 2, y + @button / 2 + size / 3}
+        )
+      end)
+
+    # A yellow dot on a track button when the track has content.
+    Enum.reduce(1..4, graph, fn id, graph ->
+      circle(graph, 10, id: {:filled, id}, fill: :yellow, hidden: true, translate: {track_x(id) + @button - 22, 192})
+    end)
+  end
+
+  # Loop position: 8 cells that fill up as the loop plays.
+  defp progress_cells(graph) do
+    Enum.reduce(0..7, graph, fn i, graph -> rect(graph, {30, 60}, id: {:cell, i}, fill: @cell_off, translate: {1840 + i * 35, 205}) end)
+  end
+
+  defp button_at(width, {x, y}) do
+    Enum.find_value(buttons(width), fn {id, {bx, by}, _label} ->
+      if x >= bx and x < bx + @button and y >= by and y < by + @button, do: id
+    end)
+  end
 
   @impl Scenic.Scene
   def handle_input({:cursor_button, {_button, 1, _mods, pos}}, _id, scene) do
     {width, _height} = scene.assigns.size
+    {_x, y} = pos = canvas(scene, pos)
 
-    case canvas(scene, pos) do
-      {x, y} when y < @bar and x >= width - @prev and x < width - @prev + @arrow -> switch_wave(scene, -1)
-      {x, y} when y < @bar and x >= width - @next and x < width - @next + @arrow -> switch_wave(scene, 1)
+    cond do
+      y >= @bar -> play(assign(scene, down: true), pos)
+      id = button_at(width, pos) -> press(scene, id)
       # The rest of the bar doesn't play.
-      {_x, y} when y < @bar -> {:noreply, scene}
-      pos -> play(assign(scene, down: true), pos)
+      true -> {:noreply, scene}
     end
   end
 
   def handle_input({:cursor_button, {_button, 0, _mods, _pos}}, _id, scene) do
     Synth.off(:live)
+    # The release goes into the take too, so it has silence where you lifted your finger.
+    if scene.assigns.down, do: Sequencer.touch(scene.assigns.freq, 0.0, scene.assigns.wave)
 
     scene.assigns.graph
     |> unlight(scene.assigns.lit)
+    |> echo(scene.assigns.view)
     |> Graph.modify(:dot, &circle(&1, 60, hidden: true))
     |> show(assign(scene, down: false, lit: nil))
   end
@@ -521,6 +601,141 @@ defmodule Theremin.Scene do
   def handle_input({:key, {:key_volumedown, 1, _mods}}, _id, scene), do: switch_wave(scene, -1)
 
   def handle_input(_input, _id, scene), do: {:noreply, scene}
+
+  @impl GenServer
+  def handle_info(:refresh, scene), do: refresh(scene)
+
+  defp press(scene, :wave_prev), do: switch_wave(scene, -1)
+  defp press(scene, :wave_next), do: switch_wave(scene, 1)
+
+  defp press(scene, {:track, id}) do
+    selected = scene.assigns.selected
+    selected = if id in selected, do: MapSet.delete(selected, id), else: MapSet.put(selected, id)
+    redraw(assign(scene, selected: selected, delete_armed_at: nil))
+  end
+
+  defp press(scene, :rec) do
+    # REC needs exactly one selected track.
+    with [id] <- MapSet.to_list(scene.assigns.selected), do: Sequencer.record(id)
+    refresh(scene)
+  end
+
+  defp press(scene, :play) do
+    Sequencer.play(Enum.sort(scene.assigns.selected))
+    refresh(scene)
+  end
+
+  defp press(scene, :stop) do
+    Sequencer.stop()
+    refresh(scene)
+  end
+
+  defp press(scene, :shorter), do: change_length(scene, -1)
+  defp press(scene, :longer), do: change_length(scene, 1)
+
+  # DEL needs a second tap within 2 s, and at least one selected track.
+  defp press(%{assigns: %{selected: selected, delete_armed_at: armed_at}} = scene, :delete) do
+    cond do
+      MapSet.size(selected) == 0 ->
+        {:noreply, scene}
+
+      armed_at != nil and now() - armed_at <= 2_000 ->
+        Sequencer.clear(Enum.sort(selected))
+        refresh(assign(scene, delete_armed_at: nil))
+
+      true ->
+        redraw(assign(scene, delete_armed_at: now()))
+    end
+  end
+
+  defp change_length(scene, step) do
+    Sequencer.set_length(div(scene.assigns.status.length_ms, 1_000) + step)
+    refresh(scene)
+  end
+
+  defp refresh(scene), do: redraw(assign(scene, status: Sequencer.status()))
+
+  # Pushes a new graph only when what the bar shows has changed.
+  defp redraw(scene) do
+    view = view(scene.assigns)
+
+    if view == scene.assigns.view do
+      {:noreply, scene}
+    else
+      scene.assigns.graph |> apply_view(view, scene.assigns) |> show(assign(scene, view: view))
+    end
+  end
+
+  # What the bar should show, from the selection and the sequencer's status.
+  defp view(%{selected: selected, status: status, delete_armed_at: armed_at}) do
+    armed = armed_at != nil and now() - armed_at <= 2_000
+    idle = status.mode == :idle
+
+    rec =
+      cond do
+        match?({:recording, _, _}, status.mode) -> @red
+        MapSet.size(selected) == 1 -> @idle
+        true -> @dim
+      end
+
+    delete =
+      cond do
+        armed -> @red
+        MapSet.size(selected) == 0 -> @dim
+        true -> @idle
+      end
+
+    length = if idle, do: @idle, else: @dim
+
+    fills =
+      Map.new(1..4, &{{:track, &1}, if(&1 in selected, do: @selected, else: @idle)})
+      |> Map.merge(%{
+        rec: rec,
+        play: if(match?({:playing, _}, status.mode), do: @green, else: @idle),
+        shorter: length,
+        longer: length,
+        delete: delete
+      })
+
+    %{
+      fills: fills,
+      filled: status.filled,
+      lit: if(idle, do: 0, else: min(div(8 * status.position_ms, status.length_ms) + 1, 8)),
+      length: "#{div(status.length_ms, 1_000)} s",
+      # Bands lit by playback: note index => fire colour of its volume.
+      echo: Map.new(status.sounding, fn {freq, amp} -> {round(12 * :math.log2(freq / @low)), fire(1 - amp / 0.5)} end),
+      delete: if(armed, do: "again?", else: "DEL")
+    }
+  end
+
+  defp apply_view(graph, view, %{view: old, lit: live}) do
+    # Playback bands that went quiet go dark, unless the finger is on them.
+    old_echo = if old, do: Map.keys(old.echo), else: []
+    graph = Enum.reduce((old_echo -- Map.keys(view.echo)) -- [live], graph, &unlight(&2, &1))
+    graph = echo(graph, view)
+
+    graph =
+      Enum.reduce(view.fills, graph, fn {id, fill}, graph ->
+        Graph.modify(graph, {:bg, id}, &Scenic.Primitive.put_style(&1, :fill, fill))
+      end)
+
+    graph =
+      Enum.reduce(1..4, graph, fn id, graph ->
+        Graph.modify(graph, {:filled, id}, &Scenic.Primitive.put_style(&1, :hidden, id not in view.filled))
+      end)
+
+    graph =
+      Enum.reduce(0..7, graph, fn i, graph ->
+        Graph.modify(graph, {:cell, i}, &Scenic.Primitive.put_style(&1, :fill, if(i < view.lit, do: @cell_on, else: @cell_off)))
+      end)
+
+    graph
+    |> Graph.modify({:label, :delete}, &text(&1, view.delete))
+    |> Graph.modify(:length, &text(&1, view.length))
+  end
+
+  defp echo(graph, nil), do: graph
+  defp echo(graph, view), do: Enum.reduce(view.echo, graph, fn {n, fill}, graph -> paint(graph, n, fill) end)
 
   # Step through @waves, wrapping around at both ends.
   defp switch_wave(scene, step) do
@@ -541,16 +756,18 @@ defmodule Theremin.Scene do
     y = max(y, @bar)
     quiet = (y - @bar) / (height - @bar)
     freq = @low * 2 ** (@octaves * x / width)
-    Synth.set(:live, freq, 0.5 * (1 - quiet))
+    amp = 0.5 * (1 - quiet)
+    Synth.set(:live, freq, amp)
+    Sequencer.touch(freq, amp, scene.assigns.wave)
     lit = round(12 * @octaves * x / width)
 
     # Recoloured on every move: the colour follows the volume.
     scene.assigns.graph
-    |> then(&if(scene.assigns.lit == lit, do: &1, else: unlight(&1, scene.assigns.lit)))
+    |> then(&if(scene.assigns.lit == lit, do: &1, else: &1 |> unlight(scene.assigns.lit) |> echo(scene.assigns.view)))
     |> paint(lit, fire(quiet))
     |> Graph.modify(:dot, &circle(&1, 60, translate: {x, y}, hidden: false))
     |> Graph.modify(:note, &text(&1, "#{note_name(freq)}  #{round(freq)} Hz"))
-    |> show(assign(scene, lit: lit))
+    |> show(assign(scene, lit: lit, freq: freq))
   end
 
   # The nearest note, counted in semitones from A4 (440 Hz).
@@ -559,6 +776,8 @@ defmodule Theremin.Scene do
     "#{Enum.at(@names, Integer.mod(n, 12))}#{4 + Integer.floor_div(n + 9, 12)}"
   end
 
+  defp now, do: System.monotonic_time(:millisecond)
+
   defp show(graph, scene), do: {:noreply, scene |> assign(graph: graph) |> push_graph(graph)}
 end
 ```
@@ -566,7 +785,7 @@ end
 ## Play
 
 Detach the IEx console from the screen, then start the pad. The synth
-has to be running (see above).
+and the sequencer have to be running (see above).
 
 The screen is 1080 × 2160 in portrait, and the driver only draws in
 portrait. So the scene draws on a 2160 × 1080 canvas and turns it a
@@ -596,6 +815,7 @@ Try these:
 * Change `@low` or `@octaves` in the scene, run **Stop**, then run
   the scene and **Play** cells again.
 * Add a waveform of your own to `shape/2` in `Synth`.
+* Record a bass line on track 1, then a melody on track 2 while it plays.
 * Replace the volume with the phone's tilt from the
   [Sensors](03_sensors.livemd) notebook.
 
