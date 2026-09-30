@@ -73,6 +73,9 @@ defmodule Synth do
   def initial, do: Map.new(@voices, &{&1, voice()})
 
   @doc "Renders `n` samples of all voices mixed, as S16_LE, and returns them with the updated voices."
+  # Two ticks can land in the same sample after a stall; the ramps below would divide by zero.
+  def render(voices, 0), do: {<<>>, voices}
+
   def render(voices, n) do
     # Silent voices cost nothing. Each sounding voice becomes a tuple that is advanced once per sample:
     # {id, phase, phase step, change of the phase step, amp, change of amp, wave}.
@@ -167,6 +170,9 @@ true = zeros == <<0::size(1600)>>
 sums = Enum.zip_with(decode.(live), decode.(track), &(&1 + &2))
 true = Enum.zip(sums, decode.(both)) |> Enum.all?(fn {sum, mixed} -> abs(sum - mixed) <= 1 end)
 
+# A 0-sample chunk (two ticks back to back after a stall) renders nothing instead of crashing.
+{<<>>, _} = Synth.render(%{silent | live: one.(:sine, 0.5)}, 0)
+
 # Five loud voices clamp to full scale instead of wrapping around.
 {loud, _} = Synth.render(Map.new(silent, fn {id, _} -> {id, one.(:square, 1.0)} end), 10)
 true = Enum.all?(decode.(loud), &(abs(&1) == 32_767))
@@ -201,18 +207,23 @@ defmodule Sequencer do
   @tracks [1, 2, 3, 4]
 
   def start, do: GenServer.start(__MODULE__, nil, name: __MODULE__)
+  @doc "Stops the sequencer's process; fine to call when it isn't running."
+  def shutdown, do: if(Process.whereis(__MODULE__), do: GenServer.stop(__MODULE__), else: :ok)
 
   @doc "Loop length for all tracks, 1 to 30 s. Returns :busy while playing or recording."
-  def set_length(seconds), do: GenServer.call(__MODULE__, {:set_length, seconds})
+  def set_length(seconds), do: call({:set_length, seconds}, :not_running)
   @doc "Loops `ids` from 0 s; `[]` means every track with content. Returns :empty if that's none."
-  def play(ids), do: GenServer.call(__MODULE__, {:play, ids})
+  def play(ids), do: call({:play, ids}, :not_running)
   @doc "Records one pass into track `id` while the other tracks with content play along."
-  def record(id) when id in @tracks, do: GenServer.call(__MODULE__, {:record, id})
-  def stop, do: GenServer.call(__MODULE__, :stop)
-  def clear(ids), do: GenServer.call(__MODULE__, {:clear, ids})
+  def record(id) when id in @tracks, do: call({:record, id}, :not_running)
+  def stop, do: call(:stop, :not_running)
+  def clear(ids), do: call({:clear, ids}, :not_running)
   @doc "The pad's current sound. Kept in the take while recording, ignored otherwise."
   def touch(freq, amp, wave), do: GenServer.cast(__MODULE__, {:touch, freq, amp, wave})
-  def status, do: GenServer.call(__MODULE__, :status)
+  def status, do: call(:status, %{mode: :idle, position_ms: 0, length_ms: 8_000, filled: [], sounding: []})
+
+  # Without a running sequencer, calls return `fallback`, so the pad keeps working instead of crashing.
+  defp call(msg, fallback), do: if(Process.whereis(__MODULE__), do: GenServer.call(__MODULE__, msg), else: fallback)
 
   @doc "The last event at or before `position` ms, or nil before the first one. `events` are sorted by time."
   # ponytail: linear scan per tick, fine for a few thousand events; keep a cursor per track if takes get long.
@@ -319,8 +330,9 @@ defmodule Sequencer do
 end
 ```
 
-This check records a 1 s take, so it takes about 1.5 s. Run it before
-starting the pad: it stops a running sequencer.
+This check records a 1 s take, so it takes about 1.5 s. It stops a
+running sequencer and its tracks; run the start cell below again
+afterwards.
 
 ```elixir
 # Check: Sequencer.at/2 finds the event in effect, and a short take records, plays, restarts and clears.
@@ -331,7 +343,7 @@ nil = Sequencer.at(events, 50)
 {300, 440.0, 0.2, :saw} = Sequencer.at(events, 5_000)
 nil = Sequencer.at([], 10)
 
-if Process.whereis(Sequencer), do: GenServer.stop(Sequencer)
+:ok = Sequencer.shutdown()
 {:ok, _} = Sequencer.start()
 
 # Nothing recorded yet: PLAY does nothing.
@@ -375,7 +387,11 @@ Sequencer.touch(330.0, 0.4, :square)
 :ok = Sequencer.set_length(0)
 %{length_ms: 1_000} = Sequencer.status()
 
-GenServer.stop(Sequencer)
+# Without a running sequencer the pad keeps working: calls fall back instead of crashing.
+:ok = Sequencer.shutdown()
+%{mode: :idle, filled: [], sounding: []} = Sequencer.status()
+:not_running = Sequencer.play([])
+:ok = Sequencer.shutdown()
 ```
 
 Start it:
@@ -823,7 +839,7 @@ Try these:
 
 ```elixir
 Scenic.ViewPort.stop(viewport)
-GenServer.stop(Sequencer)
+Sequencer.shutdown()
 Synth.stop()
 File.write!(Path.join(fbcon, "bind"), "1")
 ```
