@@ -6,11 +6,14 @@ Turn the screen into a theremin: slide a finger left and right to change
 the pitch, up and down to change the volume. The `< sine >` arrows in
 the top bar, or the volume buttons, switch the waveform.
 
-Two parts work together:
+Three parts work together:
 
-* `Synth`, a process that computes the sound sample by sample and
-  streams it into one long-running `aplay`,
-* a Scenic scene that turns touches into `Synth.set(:live, frequency, volume)`.
+* `Synth`, a process that computes the sound of 5 voices sample by
+  sample and streams the mix into one long-running `aplay`,
+* `Sequencer`, which records what you play into 4 tracks and plays them
+  back on voices 1 to 4,
+* a Scenic scene that turns touches into `Synth.set(:live, frequency, volume)`
+  and draws the sequencer's buttons.
 
 This builds on the [Audio](10_audio.livemd) and
 [Screen, touch and buttons](11_screen_touch_buttons.livemd) notebooks.
@@ -176,6 +179,209 @@ Start it and play a note for one second:
 Synth.set(:live, 440, 0.3)
 Process.sleep(1000)
 Synth.off(:live)
+```
+
+## The sequencer
+
+The sequencer has 4 tracks that share one loop length. A track stores
+what you played as a list of `{time_ms, frequency, volume, waveform}`
+events, not as sound. Every 10 ms it looks up, for each playing track,
+the last event at or before the current loop position and sends it to
+that track's voice in `Synth`, only when it changed.
+
+Recording runs for exactly one loop from 0 s while the other tracks
+with content play along, then stops by itself. A take replaces what was
+on the track before.
+
+```elixir
+defmodule Sequencer do
+  use GenServer
+
+  @tick_ms 10
+  @tracks [1, 2, 3, 4]
+
+  def start, do: GenServer.start(__MODULE__, nil, name: __MODULE__)
+
+  @doc "Loop length for all tracks, 1 to 30 s. Returns :busy while playing or recording."
+  def set_length(seconds), do: GenServer.call(__MODULE__, {:set_length, seconds})
+  @doc "Loops `ids` from 0 s; `[]` means every track with content. Returns :empty if that's none."
+  def play(ids), do: GenServer.call(__MODULE__, {:play, ids})
+  @doc "Records one pass into track `id` while the other tracks with content play along."
+  def record(id) when id in @tracks, do: GenServer.call(__MODULE__, {:record, id})
+  def stop, do: GenServer.call(__MODULE__, :stop)
+  def clear(ids), do: GenServer.call(__MODULE__, {:clear, ids})
+  @doc "The pad's current sound. Kept in the take while recording, ignored otherwise."
+  def touch(freq, amp, wave), do: GenServer.cast(__MODULE__, {:touch, freq, amp, wave})
+  def status, do: GenServer.call(__MODULE__, :status)
+
+  @doc "The last event at or before `position` ms, or nil before the first one. `events` are sorted by time."
+  # ponytail: linear scan per tick, fine for a few thousand events; keep a cursor per track if takes get long.
+  def at(events, position), do: events |> Enum.take_while(fn {t, _, _, _} -> t <= position end) |> List.last()
+
+  @impl GenServer
+  def init(nil) do
+    :timer.send_interval(@tick_ms, :tick)
+    {:ok, %{length_ms: 8_000, tracks: Map.new(@tracks, &{&1, []}), mode: :idle, t0: 0, take: [], sent: %{}}}
+  end
+
+  @impl GenServer
+  def handle_call({:set_length, seconds}, _from, %{mode: :idle} = s),
+    do: {:reply, :ok, %{s | length_ms: 1_000 * (seconds |> max(1) |> min(30))}}
+
+  def handle_call({:set_length, _seconds}, _from, s), do: {:reply, :busy, s}
+
+  def handle_call({:play, ids}, _from, s) do
+    case if(ids == [], do: filled(s), else: ids) do
+      [] -> {:reply, :empty, s}
+      ids -> {:reply, :ok, start(s, {:playing, ids})}
+    end
+  end
+
+  def handle_call({:record, id}, _from, s), do: {:reply, :ok, start(s, {:recording, id, filled(s) -- [id]})}
+  def handle_call(:stop, _from, s), do: {:reply, :ok, idle(s)}
+
+  def handle_call({:clear, ids}, _from, s) do
+    # Clearing the track being recorded also throws away the take.
+    s =
+      case s.mode do
+        {:recording, id, _} -> if id in ids, do: idle(s), else: s
+        _ -> s
+      end
+
+    {:reply, :ok, %{s | tracks: Enum.reduce(ids, s.tracks, &Map.put(&2, &1, []))}}
+  end
+
+  def handle_call(:status, _from, s) do
+    # What the playing tracks sound like right now, so the pad can light their bands.
+    sounding = for({_id, {_t, freq, amp, _wave}} <- s.sent, amp > 0, do: {freq, amp}) |> Enum.sort()
+    {:reply, %{mode: s.mode, position_ms: position(s), length_ms: s.length_ms, filled: filled(s), sounding: sounding}, s}
+  end
+
+  @impl GenServer
+  def handle_cast({:touch, freq, amp, wave}, %{mode: {:recording, _, _}} = s),
+    do: {:noreply, %{s | take: [{position(s), freq, amp, wave} | s.take]}}
+
+  def handle_cast({:touch, _freq, _amp, _wave}, s), do: {:noreply, s}
+
+  @impl GenServer
+  def handle_info(:tick, %{mode: :idle} = s), do: {:noreply, s}
+
+  def handle_info(:tick, %{mode: {:recording, id, _}} = s) do
+    if position(s) >= s.length_ms do
+      tracks = %{s.tracks | id => Enum.reverse(s.take)}
+      {:noreply, %{idle(s) | tracks: tracks}}
+    else
+      {:noreply, replay(s)}
+    end
+  end
+
+  def handle_info(:tick, s), do: {:noreply, replay(s)}
+
+  # Sends each playing track's current event to its Synth voice, only when it changed.
+  defp replay(s) do
+    ids =
+      case s.mode do
+        {:playing, ids} -> ids
+        {:recording, _id, ids} -> ids
+      end
+
+    pos = rem(position(s), s.length_ms)
+
+    Enum.reduce(ids, s, fn id, s ->
+      event = at(s.tracks[id], pos)
+      if event != s.sent[id], do: voice(id, event)
+      %{s | sent: Map.put(s.sent, id, event)}
+    end)
+  end
+
+  defp voice(id, nil), do: Synth.off(id)
+
+  defp voice(id, {_t, freq, amp, wave}) do
+    Synth.wave(id, wave)
+    Synth.set(id, freq, amp)
+  end
+
+  defp start(s, mode), do: %{silence(s) | mode: mode, t0: now(), take: []}
+  defp idle(s), do: %{silence(s) | mode: :idle, take: []}
+
+  defp silence(s) do
+    Enum.each(@tracks, &Synth.off/1)
+    %{s | sent: %{}}
+  end
+
+  defp filled(s), do: for({id, events} <- s.tracks, events != [], do: id)
+
+  defp position(%{mode: :idle}), do: 0
+  defp position(%{mode: {:recording, _, _}} = s), do: now() - s.t0
+  defp position(s), do: rem(now() - s.t0, s.length_ms)
+
+  defp now, do: System.monotonic_time(:millisecond)
+end
+```
+
+This check records a 1 s take, so it takes about 1.5 s. Run it before
+starting the pad: it stops a running sequencer.
+
+```elixir
+# Check: Sequencer.at/2 finds the event in effect, and a short take records, plays, restarts and clears.
+events = [{100, 220.0, 0.5, :sine}, {300, 440.0, 0.2, :saw}]
+nil = Sequencer.at(events, 50)
+{100, 220.0, 0.5, :sine} = Sequencer.at(events, 100)
+{100, 220.0, 0.5, :sine} = Sequencer.at(events, 299)
+{300, 440.0, 0.2, :saw} = Sequencer.at(events, 5_000)
+nil = Sequencer.at([], 10)
+
+if Process.whereis(Sequencer), do: GenServer.stop(Sequencer)
+{:ok, _} = Sequencer.start()
+
+# Nothing recorded yet: PLAY does nothing.
+:empty = Sequencer.play([])
+
+# A one-pass take of 1 s into track 1 ends by itself.
+:ok = Sequencer.set_length(1)
+:ok = Sequencer.record(1)
+Sequencer.touch(440.0, 0.3, :sine)
+Process.sleep(200)
+Sequencer.touch(440.0, 0.0, :sine)
+Process.sleep(1_000)
+%{mode: :idle, filled: [1], length_ms: 1_000} = Sequencer.status()
+
+# PLAY with nothing selected plays every track with content; the length can't change meanwhile.
+:ok = Sequencer.play([])
+%{mode: {:playing, [1]}} = Sequencer.status()
+# 50 ms in, track 1 sounds as recorded; its band can light up.
+Process.sleep(50)
+%{sounding: [{440.0, 0.3}]} = Sequencer.status()
+:busy = Sequencer.set_length(5)
+
+# REC while playing restarts in recording mode; STOP throws the unfinished take away.
+:ok = Sequencer.record(2)
+%{mode: {:recording, 2, [1]}} = Sequencer.status()
+Sequencer.touch(300.0, 0.4, :saw)
+:ok = Sequencer.stop()
+%{mode: :idle, filled: [1]} = Sequencer.status()
+
+# Clearing the track being recorded stops the recording and keeps nothing.
+:ok = Sequencer.record(3)
+Sequencer.touch(330.0, 0.4, :square)
+:ok = Sequencer.clear([3])
+%{mode: :idle, filled: [1]} = Sequencer.status()
+
+# Clearing, and the length limits.
+:ok = Sequencer.clear([1])
+%{filled: []} = Sequencer.status()
+:ok = Sequencer.set_length(99)
+%{length_ms: 30_000} = Sequencer.status()
+:ok = Sequencer.set_length(0)
+%{length_ms: 1_000} = Sequencer.status()
+
+GenServer.stop(Sequencer)
+```
+
+Start it:
+
+```elixir
+{:ok, _} = Sequencer.start()
 ```
 
 ## The pad
@@ -397,6 +603,7 @@ Try these:
 
 ```elixir
 Scenic.ViewPort.stop(viewport)
+GenServer.stop(Sequencer)
 Synth.stop()
 File.write!(Path.join(fbcon, "bind"), "1")
 ```
