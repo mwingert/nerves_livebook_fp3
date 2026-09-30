@@ -140,8 +140,11 @@ The screen spans 4 octaves, from A2 (110 Hz) on the left to A6
 for sharps like the black keys on a piano, and every white key is
 labelled, with the Cs in white.
 The pitch slides smoothly between them, so a note is only in tune in
-the middle of its band. The top of the screen is loud and the bottom
+the middle of its band. The top of the pad is loud and the bottom
 is silent.
+
+A bar across the top shows the note and its frequency. Its right side
+is left free for buttons; touching the bar doesn't play.
 
 ```elixir
 defmodule Theremin.Scene do
@@ -153,6 +156,8 @@ defmodule Theremin.Scene do
   @octaves 4
   @waves [:sine, :square, :saw]
   @names ~w(A A# B C C# D D# E F F# G G#)
+  # Height of the top bar: the note, the waveform, and room for buttons on the right.
+  @bar 200
 
   @impl Scenic.Scene
   def init(scene, _param, _opts) do
@@ -167,8 +172,9 @@ defmodule Theremin.Scene do
           g
           |> rect({width, height}, fill: {20, 24, 60})
           |> note_bands(width, height)
-          |> text("Slide to play", id: :note, font_size: 96, fill: :white, translate: {60, 160})
-          |> text("sine: volume buttons change it", id: :wave, fill: :light_gray, translate: {60, 240})
+          |> rect({width, @bar}, fill: {10, 12, 30})
+          |> text("Slide to play", id: :note, font_size: 80, fill: :white, translate: {40, 95})
+          |> text("sine: volume buttons change it", id: :wave, font_size: 36, fill: :light_gray, translate: {40, 165})
           |> circle(60, id: :dot, fill: :yellow, hidden: true)
         end,
         rotate: -:math.pi() / 2,
@@ -188,7 +194,7 @@ defmodule Theremin.Scene do
       name = Enum.at(@names, Integer.mod(n, 12))
       x = band * (n - 0.5)
       sharp = String.ends_with?(name, "#")
-      graph = rect(graph, {band, height}, id: {:band, n}, fill: dark(n), stroke: {1, {20, 24, 60}}, translate: {x, 0})
+      graph = rect(graph, {band, height - @bar}, id: {:band, n}, fill: dark(n), stroke: {1, {20, 24, 60}}, translate: {x, @bar})
 
       cond do
         sharp -> graph
@@ -216,7 +222,13 @@ defmodule Theremin.Scene do
     do: text(graph, note_name(@low * 2 ** (n / 12)), font_size: 30, fill: fill, text_align: :center, translate: pos)
 
   @impl Scenic.Scene
-  def handle_input({:cursor_button, {_button, 1, _mods, pos}}, _id, scene), do: play(assign(scene, down: true), pos)
+  def handle_input({:cursor_button, {_button, 1, _mods, pos}}, _id, scene) do
+    case canvas(scene, pos) do
+      # The bar: reserved for buttons.
+      {_x, y} when y < @bar -> {:noreply, scene}
+      pos -> play(assign(scene, down: true), pos)
+    end
+  end
 
   def handle_input({:cursor_button, {_button, 0, _mods, _pos}}, _id, scene) do
     Synth.off()
@@ -227,7 +239,7 @@ defmodule Theremin.Scene do
     |> show(assign(scene, down: false, lit: nil))
   end
 
-  def handle_input({:cursor_pos, pos}, _id, %{assigns: %{down: true}} = scene), do: play(scene, pos)
+  def handle_input({:cursor_pos, pos}, _id, %{assigns: %{down: true}} = scene), do: play(scene, canvas(scene, pos))
 
   # Only the volume keys: every touch also arrives as a :btn_touch key event.
   def handle_input({:key, {key, 1, _mods}}, _id, scene) when key in [:key_volumeup, :key_volumedown] do
@@ -242,18 +254,22 @@ defmodule Theremin.Scene do
 
   def handle_input(_input, _id, scene), do: {:noreply, scene}
 
-  defp play(scene, {screen_x, screen_y}) do
+  # Touches arrive in portrait screen coordinates: turn them back into the canvas.
+  defp canvas(%{assigns: %{size: {width, _height}}}, {screen_x, screen_y}), do: {width - screen_y, screen_x}
+
+  defp play(scene, {x, y}) do
     {width, height} = scene.assigns.size
-    # Touches arrive in portrait screen coordinates: turn them back into the canvas.
-    {x, y} = {width - screen_y, screen_x}
+    # Dragging into the bar keeps playing at full volume.
+    y = max(y, @bar)
+    quiet = (y - @bar) / (height - @bar)
     freq = @low * 2 ** (@octaves * x / width)
-    Synth.set(freq, 0.5 * (1 - y / height))
+    Synth.set(freq, 0.5 * (1 - quiet))
     lit = round(12 * @octaves * x / width)
 
     # Recoloured on every move: the colour follows the volume.
     scene.assigns.graph
     |> then(&if(scene.assigns.lit == lit, do: &1, else: unlight(&1, scene.assigns.lit)))
-    |> paint(lit, fire(y / height))
+    |> paint(lit, fire(quiet))
     |> Graph.modify(:dot, &circle(&1, 60, translate: {x, y}, hidden: false))
     |> Graph.modify(:note, &text(&1, "#{note_name(freq)}  #{round(freq)} Hz"))
     |> show(assign(scene, lit: lit))
