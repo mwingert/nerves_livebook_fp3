@@ -513,8 +513,8 @@ defmodule Sequencer do
   end
 
   def handle_call(:status, _from, s) do
-    # What the playing tracks sound like right now, so the pad can light their bands.
-    sounding = for({_id, {_t, freq, amp, _instrument}} <- s.sent, amp > 0, do: {freq, amp}) |> Enum.sort()
+    # What the playing tracks sound like right now, so the pad can light their bands in each track's colours.
+    sounding = for({id, {_t, freq, amp, _instrument}} <- s.sent, amp > 0, do: {id, freq, amp}) |> Enum.sort()
     {:reply, %{mode: s.mode, position_ms: position(s), length_ms: s.length_ms, filled: filled(s), sounding: sounding}, s}
   end
 
@@ -611,9 +611,9 @@ Process.sleep(1_000)
 # PLAY with nothing selected plays every track with content; the length can't change meanwhile.
 :ok = Sequencer.play([])
 %{mode: {:playing, [1]}} = Sequencer.status()
-# 50 ms in, track 1 sounds as recorded; its band can light up.
+# 50 ms in, track 1 sounds as recorded; its band can light up in track 1's colours.
 Process.sleep(50)
-%{sounding: [{440.0, 0.3}]} = Sequencer.status()
+%{sounding: [{1, 440.0, 0.3}]} = Sequencer.status()
 :busy = Sequencer.set_length(5)
 
 # REC while playing restarts in recording mode; STOP throws the unfinished take away.
@@ -674,7 +674,9 @@ second runs the sequencer:
 * The 8 cells on the right show where the loop is.
 
 Touching the bar doesn't play. Bands light up for the tracks playing
-back as well as for your finger.
+back as well as for your finger: your finger in fire colours, each track
+in its own gradient (blue, green, violet, grey), shown as the bar in its
+button.
 
 ```elixir
 defmodule Theremin.Scene do
@@ -695,6 +697,13 @@ defmodule Theremin.Scene do
   @selected {90, 110, 230}
   @red {200, 30, 30}
   @green {30, 150, 60}
+  # Each track's gradient, loud → quiet. The loud colour is also the bar in its button.
+  @track_colors %{
+    1 => {{30, 60, 200}, {130, 220, 255}},
+    2 => {{20, 140, 50}, {170, 240, 90}},
+    3 => {{120, 40, 180}, {240, 140, 220}},
+    4 => {{110, 110, 120}, {240, 240, 245}}
+  }
   # Loop position cells.
   @cell_on {140, 170, 255}
   @cell_off {30, 36, 84}
@@ -774,6 +783,13 @@ defmodule Theremin.Scene do
     {round(180 + 75 * min(2 * t, 1)), round(220 * t), 0}
   end
 
+  # A track's gradient: its loud colour at t = 0, its quiet colour at t = 1.
+  defp gradient(id, t) do
+    t = t |> max(0) |> min(1)
+    {{r1, g1, b1}, {r2, g2, b2}} = @track_colors[id]
+    {round(r1 + (r2 - r1) * t), round(g1 + (g2 - g1) * t), round(b1 + (b2 - b1) * t)}
+  end
+
   defp paint(graph, n, fill), do: Graph.modify(graph, {:band, n}, &Scenic.Primitive.put_style(&1, :fill, fill))
 
   defp unlight(graph, nil), do: graph
@@ -817,9 +833,11 @@ defmodule Theremin.Scene do
         )
       end)
 
-    # A yellow dot on a track button when the track has content.
+    # A yellow dot on a track button when the track has content, and a bar in the track's colour.
     Enum.reduce(1..4, graph, fn id, graph ->
-      circle(graph, 10, id: {:filled, id}, fill: :yellow, hidden: true, translate: {track_x(id) + @button - 22, 192})
+      graph
+      |> circle(10, id: {:filled, id}, fill: :yellow, hidden: true, translate: {track_x(id) + @button - 22, 192})
+      |> rect({90, 10}, fill: elem(@track_colors[id], 0), translate: {track_x(id) + 20, 275})
     end)
   end
 
@@ -967,8 +985,8 @@ defmodule Theremin.Scene do
       filled: status.filled,
       lit: if(idle, do: 0, else: min(div(8 * status.position_ms, status.length_ms) + 1, 8)),
       length: "#{div(status.length_ms, 1_000)} s",
-      # Bands lit by playback: note index => fire colour of its volume.
-      echo: Map.new(status.sounding, fn {freq, amp} -> {round(12 * :math.log2(freq / @low)), fire(1 - amp / 0.5)} end),
+      # Bands lit by playback: note index => the track's colour for its volume. On a shared note, the higher track wins.
+      echo: Map.new(status.sounding, fn {id, freq, amp} -> {round(12 * :math.log2(freq / @low)), gradient(id, 1 - amp / 0.5)} end),
       delete: if(armed, do: "again?", else: "DEL")
     }
   end
