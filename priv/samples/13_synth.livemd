@@ -46,8 +46,8 @@ Frequency and volume slide from their old to their new value across
 each chunk, and the waveform's phase carries over between chunks.
 Without that, every finger movement would click.
 
-The synth has 5 voices: `:live` for the pad and `1` to `4` for the
-sequencer's tracks. Each chunk adds the sounding voices up sample by
+The synth has 6 voices: `:live` for the pad, `1` to `4` for the
+sequencer's tracks and `:click` for its metronome. Each chunk adds the sounding voices up sample by
 sample in one pass and skips silent ones, so an idle track costs almost
 nothing.
 
@@ -67,8 +67,8 @@ defmodule Synth do
   @tick_ms 5
   # How far ahead of the speaker we write: lower is snappier, higher survives hiccups.
   @lead div(@rate * 30, 1000)
-  # The pad plays on :live, the sequencer's tracks on 1 to 4.
-  @voices [:live, 1, 2, 3, 4]
+  # The pad plays on :live, the sequencer's tracks on 1 to 4, its metronome on :click.
+  @voices [:live, 1, 2, 3, 4, :click]
 
   # Each instrument: sound source, loudness, envelope times in seconds (attack, decay, release),
   # sustain level, whether it ignores note off, and the second oscillator's pitch ratio.
@@ -372,7 +372,7 @@ low = %{held.(:saw, 0.5) | freq: 220.0, cur_freq: 220.0}
 true = abs(after_odd.live.phase - 101 * 440 / 48_000) < 1.0e-9
 true = abs(after_odd[1].phase - 101 * 220 / 48_000) < 1.0e-9
 
-# Five loud voices clamp to full scale instead of wrapping around.
+# All voices loud clamp to full scale instead of wrapping around.
 {loud, _} = Synth.render(Map.new(silent, fn {id, _} -> {id, held.(:square, 1.0)} end), 10)
 true = Enum.all?(decode.(loud), &(abs(&1) == 32_767))
 
@@ -439,7 +439,8 @@ Synth.off(:live)
 
 ## The sequencer
 
-The sequencer has 4 tracks that share one loop length. A track stores
+The sequencer has 4 tracks that share one loop: a tempo in BPM (60 to
+180) and a length in bars of 4 beats (1, 2, 4 or 8). A track stores
 what you played as a list of `{time_ms, frequency, volume, instrument}`
 events, not as sound. Every 10 ms it looks up, for each playing track,
 the last event at or before the current loop position and sends it to
@@ -447,7 +448,8 @@ that track's voice in `Synth`, only when it changed.
 
 Recording runs for exactly one loop from 0 s while the other tracks
 with content play along, then stops by itself. A take replaces what was
-on the track before.
+on the track before. While recording, a hihat clicks on every beat,
+louder on the first beat of each bar.
 
 ```elixir
 defmodule Sequencer do
@@ -455,13 +457,16 @@ defmodule Sequencer do
 
   @tick_ms 10
   @tracks [1, 2, 3, 4]
+  @bars [1, 2, 4, 8]
 
   def start, do: GenServer.start(__MODULE__, nil, name: __MODULE__)
   @doc "Stops the sequencer's process; fine to call when it isn't running."
   def shutdown, do: if(Process.whereis(__MODULE__), do: GenServer.stop(__MODULE__), else: :ok)
 
-  @doc "Loop length for all tracks, 1 to 30 s. Returns :busy while playing or recording."
-  def set_length(seconds), do: call({:set_length, seconds}, :not_running)
+  @doc "Tempo for all tracks, 60 to 180 BPM. Returns :busy while playing or recording."
+  def set_tempo(bpm), do: call({:set_tempo, bpm |> max(60) |> min(180)}, :not_running)
+  @doc "Loop length for all tracks in bars of 4 beats: 1, 2, 4 or 8. Returns :busy while playing or recording."
+  def set_bars(bars) when bars in @bars, do: call({:set_bars, bars}, :not_running)
   @doc "Loops `ids` from 0 s; `[]` means every track with content. Returns :empty if that's none."
   def play(ids), do: call({:play, ids}, :not_running)
   @doc "Records one pass into track `id` while the other tracks with content play along."
@@ -470,7 +475,7 @@ defmodule Sequencer do
   def clear(ids), do: call({:clear, ids}, :not_running)
   @doc "The pad's current sound. Kept in the take while recording, ignored otherwise."
   def touch(freq, amp, instrument), do: GenServer.cast(__MODULE__, {:touch, freq, amp, instrument})
-  def status, do: call(:status, %{mode: :idle, position_ms: 0, length_ms: 8_000, filled: [], sounding: []})
+  def status, do: call(:status, %{mode: :idle, position_ms: 0, length_ms: 4_000, bpm: 120, bars: 2, filled: [], sounding: []})
 
   # Without a running sequencer, calls return `fallback`, so the pad keeps working instead of crashing.
   defp call(msg, fallback), do: if(Process.whereis(__MODULE__), do: GenServer.call(__MODULE__, msg), else: fallback)
@@ -482,14 +487,14 @@ defmodule Sequencer do
   @impl GenServer
   def init(nil) do
     :timer.send_interval(@tick_ms, :tick)
-    {:ok, %{length_ms: 8_000, tracks: Map.new(@tracks, &{&1, []}), mode: :idle, t0: 0, take: [], sent: %{}}}
+    s = %{bpm: 120, bars: 2, tracks: Map.new(@tracks, &{&1, []}), mode: :idle, t0: 0, take: [], sent: %{}, beat: nil}
+    {:ok, with_length(s)}
   end
 
   @impl GenServer
-  def handle_call({:set_length, seconds}, _from, %{mode: :idle} = s),
-    do: {:reply, :ok, %{s | length_ms: 1_000 * (seconds |> max(1) |> min(30))}}
-
-  def handle_call({:set_length, _seconds}, _from, s), do: {:reply, :busy, s}
+  def handle_call({:set_tempo, bpm}, _from, %{mode: :idle} = s), do: {:reply, :ok, with_length(%{s | bpm: bpm})}
+  def handle_call({:set_bars, bars}, _from, %{mode: :idle} = s), do: {:reply, :ok, with_length(%{s | bars: bars})}
+  def handle_call({setting, _}, _from, s) when setting in [:set_tempo, :set_bars], do: {:reply, :busy, s}
 
   def handle_call({:play, ids}, _from, s) do
     case if(ids == [], do: filled(s), else: ids) do
@@ -515,7 +520,8 @@ defmodule Sequencer do
   def handle_call(:status, _from, s) do
     # What the playing tracks sound like right now, so the pad can light their bands in each track's colours.
     sounding = for({id, {_t, freq, amp, _instrument}} <- s.sent, amp > 0, do: {id, freq, amp}) |> Enum.sort()
-    {:reply, %{mode: s.mode, position_ms: position(s), length_ms: s.length_ms, filled: filled(s), sounding: sounding}, s}
+    status = %{mode: s.mode, position_ms: position(s), length_ms: s.length_ms, bpm: s.bpm, bars: s.bars, filled: filled(s), sounding: sounding}
+    {:reply, status, s}
   end
 
   @impl GenServer
@@ -532,7 +538,7 @@ defmodule Sequencer do
       tracks = %{s.tracks | id => Enum.reverse(s.take)}
       {:noreply, %{idle(s) | tracks: tracks}}
     else
-      {:noreply, replay(s)}
+      {:noreply, s |> click() |> replay()}
     end
   end
 
@@ -555,6 +561,19 @@ defmodule Sequencer do
     end)
   end
 
+  # The metronome: a hihat on each new beat, louder on the first beat of a bar. One-shot, so it plays out after the note off.
+  defp click(s) do
+    beat = div(position(s) * s.bpm, 60_000)
+
+    if beat != s.beat do
+      Synth.instrument(:click, :hihat)
+      Synth.set(:click, 440.0, if(rem(beat, 4) == 0, do: 0.5, else: 0.2))
+      Synth.off(:click)
+    end
+
+    %{s | beat: beat}
+  end
+
   defp voice(id, nil), do: Synth.off(id)
 
   defp voice(id, {_t, freq, amp, instrument}) do
@@ -562,7 +581,8 @@ defmodule Sequencer do
     Synth.set(id, freq, amp)
   end
 
-  defp start(s, mode), do: %{silence(s) | mode: mode, t0: now(), take: []}
+  defp start(s, mode), do: %{silence(s) | mode: mode, t0: now(), take: [], beat: nil}
+  defp with_length(s), do: Map.put(s, :length_ms, div(s.bars * 4 * 60_000, s.bpm))
   defp idle(s), do: %{silence(s) | mode: :idle, take: []}
 
   defp silence(s) do
@@ -599,14 +619,16 @@ nil = Sequencer.at([], 10)
 # Nothing recorded yet: PLAY does nothing.
 :empty = Sequencer.play([])
 
-# A one-pass take of 1 s into track 1 ends by itself.
-:ok = Sequencer.set_length(1)
+# A one-pass take of 1 bar at 180 BPM (1.33 s) into track 1 ends by itself. The metronome counts the beats meanwhile.
+:ok = Sequencer.set_bars(1)
+:ok = Sequencer.set_tempo(180)
 :ok = Sequencer.record(1)
 Sequencer.touch(440.0, 0.3, :sine)
-Process.sleep(200)
+Process.sleep(400)
+1 = :sys.get_state(Sequencer).beat
 Sequencer.touch(440.0, 0.0, :sine)
 Process.sleep(1_000)
-%{mode: :idle, filled: [1], length_ms: 1_000} = Sequencer.status()
+%{mode: :idle, filled: [1], length_ms: 1_333} = Sequencer.status()
 
 # PLAY with nothing selected plays every track with content; the length can't change meanwhile.
 :ok = Sequencer.play([])
@@ -614,7 +636,8 @@ Process.sleep(1_000)
 # 50 ms in, track 1 sounds as recorded; its band can light up in track 1's colours.
 Process.sleep(50)
 %{sounding: [{1, 440.0, 0.3}]} = Sequencer.status()
-:busy = Sequencer.set_length(5)
+:busy = Sequencer.set_tempo(100)
+:busy = Sequencer.set_bars(4)
 
 # REC while playing restarts in recording mode; STOP throws the unfinished take away.
 :ok = Sequencer.record(2)
@@ -629,13 +652,14 @@ Sequencer.touch(330.0, 0.4, :square)
 :ok = Sequencer.clear([3])
 %{mode: :idle, filled: [1]} = Sequencer.status()
 
-# Clearing, and the length limits.
+# Clearing, and the tempo limits.
 :ok = Sequencer.clear([1])
 %{filled: []} = Sequencer.status()
-:ok = Sequencer.set_length(99)
-%{length_ms: 30_000} = Sequencer.status()
-:ok = Sequencer.set_length(0)
-%{length_ms: 1_000} = Sequencer.status()
+:ok = Sequencer.set_tempo(999)
+%{bpm: 180} = Sequencer.status()
+:ok = Sequencer.set_tempo(0)
+:ok = Sequencer.set_bars(8)
+%{bpm: 60, length_ms: 32_000} = Sequencer.status()
 
 # Without a running sequencer the pad keeps working: calls fall back instead of crashing.
 :ok = Sequencer.shutdown()
@@ -660,7 +684,7 @@ The pitch slides smoothly between them, so a note is only in tune in
 the middle of its band. The top of the pad is loud and the bottom
 is silent.
 
-The bar across the top has two rows. The first shows the note and its
+The bar across the top has three rows. The first shows the note and its
 frequency, and `< sine >` arrows that step through the instruments. The
 second runs the sequencer:
 
@@ -669,9 +693,12 @@ second runs the sequencer:
   selected track and turns red while recording.
 * `PLAY` loops the selected tracks, or every track with a take when
   none is selected, until `STOP`.
-* `-` and `+` set the loop length, 1 to 30 s, while nothing runs.
+* `-` and `+` set the tempo, 60 to 180 BPM in steps of 5, and the
+  bars button cycles the loop length through 1, 2, 4 and 8 bars, while
+  nothing runs.
 * `DEL` clears the selected tracks after a second tap within 2 s.
-* The 8 cells on the right show where the loop is.
+* The third row shows where the loop is: one cell per beat, across the screen, just above the pad,
+  brighter where a bar starts. Each fills up while its beat plays and glows just before it ends.
 
 Touching the bar doesn't play. Bands light up for the tracks playing
 back as well as for your finger: your finger in fire colours, each track
@@ -687,8 +714,8 @@ defmodule Theremin.Scene do
   @low 110
   @octaves 4
   @names ~w(A A# B C C# D D# E F F# G G#)
-  # Height of the top bar. Row 1: the note and the instrument arrows. Row 2: the sequencer.
-  @bar 320
+  # Height of the top bar. Row 1: the note and the instrument arrows. Row 2: the sequencer. Row 3: the loop position.
+  @bar 400
   # Every button is a square this size.
   @button 130
   # Button colours.
@@ -707,6 +734,12 @@ defmodule Theremin.Scene do
   # Loop position cells.
   @cell_on {140, 170, 255}
   @cell_off {30, 36, 84}
+  # The first cell of each bar.
+  @cell_bar {55, 66, 140}
+  # A cell glows just before its step ends: rings around it, fading out, as {spread in px, alpha}.
+  @glow_color {180, 200, 255}
+  @glow [{4, 120}, {8, 70}, {12, 40}, {16, 20}]
+  @cell_gap 8
 
   @impl Scenic.Scene
   def init(scene, _param, _opts) do
@@ -725,8 +758,9 @@ defmodule Theremin.Scene do
           |> text("Slide to play", id: :note, font_size: 80, fill: :white, translate: {40, 105})
           |> text("sine", id: :instrument, font_size: 64, fill: :white, text_align: :center, translate: {width - 320, 96})
           |> draw_buttons(width)
-          |> text("8 s", id: :length, font_size: 56, fill: :white, text_align: :center, translate: {1410, 255})
-          |> progress_cells()
+          |> text("120", id: :tempo, font_size: 56, fill: :white, text_align: :center, translate: {1410, 240})
+          |> text("BPM", font_size: 28, fill: {150, 160, 230}, text_align: :center, translate: {1410, 285})
+          |> group(& &1, id: :steps)
           |> circle(60, id: :dot, fill: :yellow, hidden: true)
         end,
         rotate: -:math.pi() / 2,
@@ -809,9 +843,10 @@ defmodule Theremin.Scene do
         {:rec, {700, 170}, "REC"},
         {:play, {850, 170}, "PLAY"},
         {:stop, {1000, 170}, "STOP"},
-        {:shorter, {1200, 170}, "-"},
-        {:longer, {1490, 170}, "+"},
-        {:delete, {1680, 170}, "DEL"}
+        {:slower, {1200, 170}, "-"},
+        {:faster, {1490, 170}, "+"},
+        {:delete, {1680, 170}, "DEL"},
+        {:bars, {1880, 170}, "2 bars"}
       ]
   end
 
@@ -841,9 +876,57 @@ defmodule Theremin.Scene do
     end)
   end
 
-  # Loop position: 8 cells that fill up as the loop plays.
-  defp progress_cells(graph) do
-    Enum.reduce(0..7, graph, fn i, graph -> rect(graph, {30, 60}, id: {:cell, i}, fill: @cell_off, translate: {1840 + i * 35, 205}) end)
+  # Loop position: one cell per beat, across the full width, just above the pad. Each fills from the left while its
+  # beat plays. Rebuilt in the :steps group whenever the loop length changes.
+  defp progress_cells(graph, width, n) do
+    {r, g, b} = @glow_color
+    w = cell_width(width, n)
+
+    # The glows go first, so the cells cover their inner part and only the outside shows.
+    graph =
+      Enum.reduce(0..(n - 1), graph, fn i, graph ->
+        x = i * (w + @cell_gap)
+
+        group(
+          graph,
+          fn glow ->
+            Enum.reduce(@glow, glow, fn {spread, alpha}, glow ->
+              rect(glow, {w + 2 * spread, 50 + 2 * spread}, fill: {r, g, b, alpha}, translate: {x - spread, 330 - spread})
+            end)
+          end,
+          id: {:glow, i},
+          hidden: true
+        )
+      end)
+
+    Enum.reduce(0..(n - 1), graph, fn i, graph ->
+      x = i * (w + @cell_gap)
+
+      graph
+      |> rect({w, 50}, fill: if(rem(i, 4) == 0, do: @cell_bar, else: @cell_off), translate: {x, 330})
+      |> rect({1, 50}, id: {:cell, i}, fill: @cell_on, hidden: true, translate: {x, 330})
+    end)
+  end
+
+  defp cell_width(width, n), do: (width - (n - 1) * @cell_gap) / n
+
+  # How full each cell is, 0 to 1, and whether its beat is about to end (it glows then). One cell per beat.
+  def steps(%{mode: :idle, bars: bars}), do: List.duplicate({0.0, false}, 4 * bars)
+
+  def steps(%{position_ms: position, length_ms: length, bars: bars}) do
+    n = 4 * bars
+    step = length / n
+    current = min(trunc(position / step), n - 1)
+    into = position - current * step
+
+    for i <- 0..(n - 1) do
+      cond do
+        i < current -> {1.0, false}
+        # ponytail: the glow covers the last 200 ms of a beat, or half a beat when fast. Seen at the 100 ms refresh rate.
+        i == current -> {min(into / step, 1.0), step - into < min(200, step / 2)}
+        true -> {0.0, false}
+      end
+    end
   end
 
   defp button_at(width, {x, y}) do
@@ -913,8 +996,14 @@ defmodule Theremin.Scene do
     refresh(scene)
   end
 
-  defp press(scene, :shorter), do: change_length(scene, -1)
-  defp press(scene, :longer), do: change_length(scene, 1)
+  defp press(scene, :slower), do: change_tempo(scene, -5)
+  defp press(scene, :faster), do: change_tempo(scene, 5)
+
+  defp press(scene, :bars) do
+    bars = scene.assigns.status.bars
+    Sequencer.set_bars(if(bars == 8, do: 1, else: bars * 2))
+    refresh(scene)
+  end
 
   # DEL needs a second tap within 2 s, and at least one selected track.
   defp press(%{assigns: %{selected: selected, delete_armed_at: armed_at}} = scene, :delete) do
@@ -931,8 +1020,8 @@ defmodule Theremin.Scene do
     end
   end
 
-  defp change_length(scene, step) do
-    Sequencer.set_length(div(scene.assigns.status.length_ms, 1_000) + step)
+  defp change_tempo(scene, step) do
+    Sequencer.set_tempo(scene.assigns.status.bpm + step)
     refresh(scene)
   end
 
@@ -968,30 +1057,32 @@ defmodule Theremin.Scene do
         true -> @idle
       end
 
-    length = if idle, do: @idle, else: @dim
+    setting = if idle, do: @idle, else: @dim
 
     fills =
       Map.new(1..4, &{{:track, &1}, if(&1 in selected, do: @selected, else: @idle)})
       |> Map.merge(%{
         rec: rec,
         play: if(match?({:playing, _}, status.mode), do: @green, else: @idle),
-        shorter: length,
-        longer: length,
+        slower: setting,
+        faster: setting,
+        bars: setting,
         delete: delete
       })
 
     %{
       fills: fills,
       filled: status.filled,
-      lit: if(idle, do: 0, else: min(div(8 * status.position_ms, status.length_ms) + 1, 8)),
-      length: "#{div(status.length_ms, 1_000)} s",
+      steps: steps(status),
+      tempo: "#{status.bpm}",
+      bars: if(status.bars == 1, do: "1 bar", else: "#{status.bars} bars"),
       # Bands lit by playback: note index => the track's colour for its volume. On a shared note, the higher track wins.
       echo: Map.new(status.sounding, fn {id, freq, amp} -> {round(12 * :math.log2(freq / @low)), gradient(id, 1 - amp / 0.5)} end),
       delete: if(armed, do: "again?", else: "DEL")
     }
   end
 
-  defp apply_view(graph, view, %{view: old, lit: live}) do
+  defp apply_view(graph, view, %{view: old, lit: live, size: {width, _height}}) do
     # Playback bands that went quiet go dark, unless the finger is on them.
     old_echo = if old, do: Map.keys(old.echo), else: []
     graph = Enum.reduce((old_echo -- Map.keys(view.echo)) -- [live], graph, &unlight(&2, &1))
@@ -1008,13 +1099,27 @@ defmodule Theremin.Scene do
       end)
 
     graph =
-      Enum.reduce(0..7, graph, fn i, graph ->
-        Graph.modify(graph, {:cell, i}, &Scenic.Primitive.put_style(&1, :fill, if(i < view.lit, do: @cell_on, else: @cell_off)))
+      view.steps
+      |> Enum.with_index()
+      |> Enum.reduce(rebuild_steps(graph, old, view, width), fn {{full, glow}, i}, graph ->
+        graph
+        |> Graph.modify({:cell, i}, &rect(&1, {max(cell_width(width, length(view.steps)) * full, 1), 50}, hidden: full == 0))
+        |> Graph.modify({:glow, i}, &Scenic.Primitive.put_style(&1, :hidden, not glow))
       end)
 
     graph
     |> Graph.modify({:label, :delete}, &text(&1, view.delete))
-    |> Graph.modify(:length, &text(&1, view.length))
+    |> Graph.modify(:tempo, &text(&1, view.tempo))
+    |> Graph.modify({:label, :bars}, &text(&1, view.bars))
+  end
+
+  # A new number of bars means a new number of cells.
+  defp rebuild_steps(graph, %{steps: old}, %{steps: new}, _width) when length(old) == length(new), do: graph
+
+  defp rebuild_steps(graph, _old, %{steps: steps}, width) do
+    graph
+    |> Graph.delete(:step_cells)
+    |> Graph.add_to(:steps, &group(&1, fn g -> progress_cells(g, width, length(steps)) end, id: :step_cells))
   end
 
   defp echo(graph, nil), do: graph
